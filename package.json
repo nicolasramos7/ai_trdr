@@ -5,11 +5,9 @@
   "main": "src/agent.ts",
   "scripts": {
     "start": "tsx src/agent.ts",
-    "start:continuous": "tsx src/agent.ts --continuous",
-    "start:continuous:1h": "tsx src/agent.ts --continuous --interval=60",
-    "start:continuous:4h": "tsx src/agent.ts --continuous --interval=240",
-    "dashboard": "tsx src/dashboard.ts",
     "trade-once": "tsx src/agent.ts",
+    "build": "tsc --noEmit",
+    "dashboard": "tsx src/dashboard.ts",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",

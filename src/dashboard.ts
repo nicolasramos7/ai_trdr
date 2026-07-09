@@ -216,7 +216,7 @@ class TradingDashboard {
         type: 'number',
         name: 'shares',
         message: 'Enter number of shares:',
-        validate: (input) => input > 0 || 'Please enter a positive number of shares'
+        validate: (input) => (input ?? 0) > 0 || 'Please enter a positive number of shares'
       }
     ]);
 
@@ -243,7 +243,7 @@ class TradingDashboard {
         type: 'number',
         name: 'shares',
         message: 'Enter number of shares:',
-        validate: (input) => input > 0 || 'Please enter a positive number of shares'
+        validate: (input) => (input ?? 0) > 0 || 'Please enter a positive number of shares'
       }
     ]);
 

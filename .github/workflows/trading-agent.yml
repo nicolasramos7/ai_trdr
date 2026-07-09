@@ -1,0 +1,62 @@
+name: Trading agent
+
+# Hourly during US market hours, on the :30 to dodge GitHub's top-of-hour cron
+# congestion. Times are UTC; the schedule below targets EDT (UTC−4, in effect
+# for a summer/July run): 13:30–19:30 UTC == 9:30–15:30 ET, Mon–Fri.
+#   → 7 sessions per trading day, ~105 over a 3-week window.
+# NOTE: for a run that crosses into EST (winter, UTC−5), shift the hours to
+# "14-20". The agent also self-gates via isMarketOpen(), so a run that lands
+# late (GitHub cron can drift 5–20 min) just exits cleanly if the market closed.
+on:
+  schedule:
+    - cron: "30 13-19 * * 1-5"
+  workflow_dispatch: # allow manual runs for testing
+
+# Least privilege: the agent keeps no local state (portfolio lives in Alpaca and
+# each session is stateless), so the workflow never writes back to the repo.
+permissions:
+  contents: read
+
+# Don't let a delayed run overlap the next scheduled one; let the in-flight
+# session finish rather than cancelling it mid-order.
+concurrency:
+  group: trading-agent
+  cancel-in-progress: false
+
+jobs:
+  run-trading-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run trading agent (single session)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          # Optional overrides — safe to leave unset; the agent falls back to its
+          # defaults (paper endpoint, gemini-2.5-flash, profile "gemini").
+          ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL }}
+        run: npm start
+
+      - name: Upload session logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-logs-${{ github.run_id }}
+          path: results/
+          retention-days: 30
+          if-no-files-found: ignore

@@ -168,7 +168,7 @@ The project includes a comprehensive Jest-based testing suite with mock APIs for
 - Trading agent logic using OpenAI's Agents framework
 - Alpaca API integration for real paper trading
 - Stock price fetching via Alpaca market data API with Yahoo Finance fallback
-- Trading tools (buy, sell, get_portfolio, get_net_worth, get_stock_price, web_search, think)
+- Trading tools (buy, sell, get_portfolio, get_net_worth, get_stock_price, get_stock_news, think)
 - Thread persistence for conversation history
 - README auto-update functionality
 
@@ -199,7 +199,7 @@ The trading agent has access to these tools:
 - `get_net_worth` - Check total portfolio value from Alpaca account
 - `get_stock_price` - Get current price for any ticker via Alpaca/Yahoo Finance
 - `buy`/`sell` - Execute real trades via Alpaca paper trading API
-- `web_search` - Research market conditions and news
+- `get_stock_news` - Get real-time financial news + headline sentiment for a ticker via Finnhub (set `FINNHUB_API_KEY`; free key at https://finnhub.io, no credit card)
 
 ### Portfolio Schema
 
