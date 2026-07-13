@@ -651,7 +651,7 @@ const runTradingSession = async (): Promise<void> => {
     },
   ];
 
-  const maxTurns = 12;
+  const maxTurns = 8;
   for (let turn = 1; turn <= maxTurns; turn++) {
     const completion = await withRetry(
       () =>
