@@ -75,3 +75,7 @@ results/shared/
 *.bak
 *.backup
 src/agent-*-backup.ts
+
+# Guide
+
+GUIDE.md
