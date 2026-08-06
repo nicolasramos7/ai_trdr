@@ -309,22 +309,64 @@ const getPortfolio = async (): Promise<Portfolio> => {
   };
 };
 
+/** Alpaca rejects notional orders below $1. */
+const MIN_NOTIONAL = 1;
+
+/** Alpaca accepts notional to 2dp and fractional quantities to 9dp. */
+const roundTo = (value: number, decimals: number): number => {
+  const factor = Math.pow(10, decimals);
+  return Math.round(value * factor) / factor;
+};
+
+/**
+ * Size an order either by share count (whole or fractional) or by dollar
+ * amount. Notional is preferred for buys: it makes share price irrelevant to
+ * affordability and needs no price lookup to size.
+ */
+type OrderSizing = { qty: number } | { notional: number };
+
 const placeOrder = (
   symbol: string,
-  qty: number,
+  sizing: OrderSizing,
   side: "buy" | "sell"
 ): Promise<any> =>
   withRetry(
     () =>
       alpaca.createOrder({
         symbol,
-        qty,
         side,
         type: "market",
-        time_in_force: "gtc",
-      }),
+        // Fractional and notional orders are day-only — Alpaca rejects GTC on
+        // them. Day is also the safer default for whole shares: a GTC market
+        // order placed near the close can rest overnight and fill into a gap.
+        time_in_force: "day",
+        ...sizing,
+      } as any),
     `Alpaca ${side} ${symbol}`
   );
+
+// Not every asset supports fractional trading. Cache per session — the flag is
+// effectively static and a session may size several orders in the same name.
+const fractionableCache = new Map<string, boolean>();
+
+const isFractionable = async (symbol: string): Promise<boolean> => {
+  const cached = fractionableCache.get(symbol);
+  if (cached !== undefined) return cached;
+  try {
+    const asset: any = await withRetry(
+      () => alpaca.getAsset(symbol),
+      `Alpaca getAsset ${symbol}`
+    );
+    const fractionable = asset?.fractionable === true;
+    fractionableCache.set(symbol, fractionable);
+    return fractionable;
+  } catch (error) {
+    // Assume whole-share-only on failure: falling back to an integer quantity
+    // is always accepted, whereas a rejected fractional order loses the trade.
+    log(`⚠️ Could not check fractionability for ${symbol}: ${error}`);
+    return false;
+  }
+};
 
 // ---------------------------------------------------------------------------
 // Real-time financial news via Finnhub. No-op if FINNHUB_API_KEY is not set.
@@ -497,15 +539,33 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "buy",
-      description: "Buy shares of a stock at market price (Alpaca paper).",
-      parameters: tickerParam as any,
+      description:
+        "Buy a stock at market price (Alpaca paper). PREFER `notional` — the dollar amount to invest — which buys fractional shares and works for ANY stock regardless of its share price. A $50 account can buy $25 of a $700 stock. Only use `shares` when you specifically want a whole-share quantity. Share price is irrelevant to what you can afford; judge stocks on quality, not on price per share.",
+      parameters: {
+        type: "object",
+        properties: {
+          ticker: { type: "string", description: "Stock ticker symbol, e.g. AAPL" },
+          notional: {
+            type: "number",
+            description:
+              "Dollar amount to invest, e.g. 25.50 (preferred). Minimum $1. Buys fractional shares.",
+          },
+          shares: {
+            type: "number",
+            description:
+              "Number of shares to buy. May be fractional for fractionable assets. Use only if you are not using notional.",
+          },
+        },
+        required: ["ticker"],
+      } as any,
     },
   },
   {
     type: "function",
     function: {
       name: "sell",
-      description: "Sell shares of a stock you own at market price (Alpaca paper).",
+      description:
+        "Sell shares of a stock you own at market price (Alpaca paper). Fractional quantities are allowed. To close a position entirely, pass the exact share count shown by get_portfolio.",
       parameters: tickerParam as any,
     },
   },
@@ -627,17 +687,80 @@ const executeTool = async (name: string, args: any): Promise<string> => {
 
       case "buy": {
         const ticker = String(args.ticker).toUpperCase();
-        const shares = Number(args.shares);
-        if (!(shares > 0)) return `Invalid share count for ${ticker}.`;
+        const hasNotional = args.notional !== undefined && args.notional !== null;
+        const hasShares = args.shares !== undefined && args.shares !== null;
+
+        if (hasNotional && hasShares) {
+          return `Specify either notional or shares for ${ticker}, not both.`;
+        }
+        if (!hasNotional && !hasShares) {
+          return `Specify how much ${ticker} to buy: notional (dollar amount, preferred) or shares.`;
+        }
+
         const account = await getAccount();
+        const buyingPower = num(account.buying_power);
+
+        // --- Dollar-amount sizing (preferred) --------------------------------
+        if (hasNotional) {
+          const notional = roundTo(Number(args.notional), 2);
+          if (!(notional > 0)) return `Invalid notional amount for ${ticker}.`;
+          if (notional < MIN_NOTIONAL) {
+            return `Alpaca's minimum order is $${MIN_NOTIONAL.toFixed(
+              2
+            )}; requested $${notional.toFixed(2)} of ${ticker}.`;
+          }
+          if (notional > buyingPower) {
+            return `Not enough buying power for $${notional.toFixed(
+              2
+            )} of ${ticker} (have $${buyingPower.toFixed(2)}).`;
+          }
+
+          if (await isFractionable(ticker)) {
+            const order = await placeOrder(ticker, { notional }, "buy");
+            log(
+              `💰 BUY $${notional.toFixed(2)} of ${ticker} — order ${order.id} (${order.status})`
+            );
+            return `Submitted BUY $${notional.toFixed(
+              2
+            )} of ${ticker} @ market (fractional). Order ${order.id}, status ${order.status}.`;
+          }
+
+          // Whole-share-only asset: convert the dollar budget into shares.
+          const price = await getStockPrice(ticker);
+          const wholeShares = Math.floor(notional / price);
+          if (wholeShares < 1) {
+            return `${ticker} does not support fractional trading and one share costs $${price.toFixed(
+              2
+            )}, above the $${notional.toFixed(2)} budget. Pick another ticker or raise the amount.`;
+          }
+          const order = await placeOrder(ticker, { qty: wholeShares }, "buy");
+          log(`💰 BUY ${wholeShares} ${ticker} — order ${order.id} (${order.status})`);
+          return `${ticker} is not fractionable, so bought whole shares: submitted BUY ${wholeShares} ${ticker} @ market (~$${(
+            wholeShares * price
+          ).toFixed(2)}). Order ${order.id}, status ${order.status}.`;
+        }
+
+        // --- Share-count sizing ---------------------------------------------
+        let shares = Number(args.shares);
+        if (!(shares > 0)) return `Invalid share count for ${ticker}.`;
+
+        if (await isFractionable(ticker)) {
+          shares = roundTo(shares, 9);
+        } else if (!Number.isInteger(shares)) {
+          shares = Math.floor(shares);
+          if (shares < 1) {
+            return `${ticker} does not support fractional trading, so it must be bought in whole shares.`;
+          }
+        }
+
         const price = await getStockPrice(ticker);
         const cost = shares * price;
-        if (parseFloat(account.buying_power) < cost) {
+        if (buyingPower < cost) {
           return `Not enough buying power for ${shares} ${ticker} (need ~$${cost.toFixed(
             2
-          )}, have $${account.buying_power}).`;
+          )}, have $${buyingPower.toFixed(2)}).`;
         }
-        const order = await placeOrder(ticker, shares, "buy");
+        const order = await placeOrder(ticker, { qty: shares }, "buy");
         log(`💰 BUY ${shares} ${ticker} — order ${order.id} (${order.status})`);
         return `Submitted BUY ${shares} ${ticker} @ market. Order ${order.id}, status ${order.status}, est. cost $${cost.toFixed(
           2
@@ -646,16 +769,34 @@ const executeTool = async (name: string, args: any): Promise<string> => {
 
       case "sell": {
         const ticker = String(args.ticker).toUpperCase();
-        const shares = Number(args.shares);
+        let shares = Number(args.shares);
         if (!(shares > 0)) return `Invalid share count for ${ticker}.`;
+
         const positions = await getPositions();
         const position = positions.find((p: any) => p.symbol === ticker);
-        const owned = position ? parseFloat(position.qty) : 0;
-        if (owned < shares) {
+        const owned = position ? num(position.qty) : 0;
+        if (owned <= 0) return `No long position in ${ticker} to sell.`;
+
+        // Snap a near-exact request to the true position size. Fractional
+        // quantities don't round-trip cleanly through JSON and display
+        // rounding, so an intended full exit can overshoot by a fraction of a
+        // share and be rejected as "not enough shares" — leaving a position
+        // the agent believes it closed.
+        const exitTolerance = Math.max(1e-6, owned * 1e-4);
+        if (Math.abs(shares - owned) <= exitTolerance) {
+          shares = owned;
+        } else if (shares > owned) {
           return `Not enough shares of ${ticker} to sell (own ${owned}).`;
         }
+
+        if (!Number.isInteger(shares) && !(await isFractionable(ticker))) {
+          shares = Math.floor(shares);
+          if (shares < 1) return `${ticker} must be sold in whole shares.`;
+        }
+        shares = roundTo(shares, 9);
+
         const price = await getStockPrice(ticker);
-        const order = await placeOrder(ticker, shares, "sell");
+        const order = await placeOrder(ticker, { qty: shares }, "sell");
         log(`💸 SELL ${shares} ${ticker} — order ${order.id} (${order.status})`);
         return `Submitted SELL ${shares} ${ticker} @ market. Order ${order.id}, status ${order.status}, est. proceeds $${(
           shares * price
@@ -681,7 +822,9 @@ const executeTool = async (name: string, args: any): Promise<string> => {
             orderValue * 0.5
           ).toFixed(2)}, have $${buyingPower.toFixed(2)}).`;
         }
-        const order = await placeOrder(ticker, shares, "sell");
+        // Shorts are whole-share only — Alpaca does not support fractional or
+        // notional sizing on the short side.
+        const order = await placeOrder(ticker, { qty: Math.floor(shares) }, "sell");
         log(`📉 SHORT ${shares} ${ticker} — order ${order.id} (${order.status})`);
         return `Submitted SHORT SELL ${shares} ${ticker} @ market. Order ${order.id}, status ${order.status}. WARNING: unlimited loss potential.`;
       }
@@ -698,7 +841,7 @@ const executeTool = async (name: string, args: any): Promise<string> => {
         if (shares > shortSize) {
           return `Cannot cover ${shares} — only ${shortSize} ${ticker} shorted.`;
         }
-        const order = await placeOrder(ticker, shares, "buy");
+        const order = await placeOrder(ticker, { qty: Math.floor(shares) }, "buy");
         log(`📈 COVER ${shares} ${ticker} — order ${order.id} (${order.status})`);
         return `Submitted BUY TO COVER ${shares} ${ticker} @ market. Order ${order.id}, status ${order.status}.`;
       }
