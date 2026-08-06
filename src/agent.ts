@@ -13,6 +13,7 @@ import OpenAI from "openai";
 import invariant from "tiny-invariant";
 import Alpaca from "@alpacahq/alpaca-trade-api";
 import {
+  MIN_NOTIONAL,
   decideExits,
   describeExit,
   drawdownPct,
@@ -259,7 +260,6 @@ interface Portfolio {
   cash: number;
   equity: number;
   positions: Position[];
-  holdings: Record<string, number>;
   history: Array<{
     date: string;
     type: "buy" | "sell";
@@ -277,12 +277,9 @@ const getPortfolio = async (): Promise<Portfolio> => {
     getOrderHistory(100),
   ]);
 
-  const holdings: Record<string, number> = {};
   const openPositions: Position[] = positions
     .map((position: any): Position => {
       const shares = num(position.qty);
-      if (shares !== 0) holdings[position.symbol] = shares;
-
       const marketValue = num(position.market_value);
       // Recover the mark from market value when Alpaca omits current_price,
       // so the agent still sees a live price rather than $0.00.
@@ -325,7 +322,6 @@ const getPortfolio = async (): Promise<Portfolio> => {
     cash: num(account.cash),
     equity: num(account.portfolio_value),
     positions: openPositions,
-    holdings,
     history,
   };
 };
@@ -400,9 +396,6 @@ const runExitSweep = async (): Promise<string> => {
   }
   return lines.join("\n");
 };
-
-/** Alpaca rejects notional orders below $1. */
-const MIN_NOTIONAL = 1;
 
 /** Alpaca accepts notional to 2dp and fractional quantities to 9dp. */
 const roundTo = (value: number, decimals: number): number => {
