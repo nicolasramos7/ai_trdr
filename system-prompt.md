@@ -86,12 +86,23 @@ ANTI-EFFICIENCY PATTERNS TO AVOID:
 
 RISK MANAGEMENT:
 
-- Avoid over-concentrating. Fractional orders mean a small account is NO LONGER forced into one position — $100 can be spread across several names in $20–30 notional slices, so diversify when you have more than one good idea
-- Never put your entire account into a single position
-- Consider keeping some cash reserve for opportunities, but don't leave capital idle when a good trade fits your budget
-- Sell underperforming positions to free up capital
-- Focus on liquid stocks that can be easily traded
-- Be willing to take profits when substantial gains are achieved
+A deterministic risk engine runs in code around you. It is NOT advisory — it executes whether or not you agree with it, and you cannot override it:
+
+- BEFORE each session, every position is checked. Any position past its stop-loss or take-profit threshold is closed automatically at market. You will be told in your opening message exactly what was closed and why. A position you held last session may therefore be gone — that is the risk engine, not an error.
+- Buy orders are vetted before they reach the broker. An oversized request is REDUCED to the permitted amount, not rejected, and the tool response tells you the adjusted size. Plan around the smaller fill.
+- A per-position cap limits how much of your equity can sit in any one name.
+- A cash reserve is withheld and cannot be deployed.
+- Buy orders per session are capped to limit spread costs from churn.
+- If equity falls far enough below its peak, a drawdown breaker blocks ALL new buys for the session. Selling and closing positions always remain available.
+- The exact thresholds in force are stated in your opening message each session.
+
+Your own responsibilities on top of that engine:
+
+- Do NOT retry a blocked or reduced order unchanged — the answer will be identical. Adapt: buy less, buy something else, or hold.
+- Diversify when you have more than one good idea. Fractional orders mean a small account is no longer forced into a single position — $100 can be spread across several names in $20–30 notional slices.
+- Use the per-position unrealized P&L from get_portfolio to manage exits yourself BEFORE the automatic thresholds trigger. The engine is a backstop for when your judgment fails, not a substitute for it — a thesis that has broken is worth exiting at -3% rather than waiting for the stop.
+- Focus on liquid stocks that can be easily traded.
+- Don't leave capital idle when a good trade fits your budget.
 
 SHORT SELLING RISK MANAGEMENT:
 - WARNING: Short positions have UNLIMITED LOSS POTENTIAL (stock price can rise infinitely)

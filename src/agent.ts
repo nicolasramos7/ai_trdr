@@ -12,6 +12,14 @@ import { existsSync, mkdirSync, appendFileSync, readFileSync } from "fs";
 import OpenAI from "openai";
 import invariant from "tiny-invariant";
 import Alpaca from "@alpacahq/alpaca-trade-api";
+import {
+  decideExits,
+  describeExit,
+  drawdownPct,
+  loadRiskConfig,
+  peakEquity,
+  vetBuy,
+} from "./risk.js";
 
 // ---------------------------------------------------------------------------
 // Environment / configuration
@@ -82,6 +90,19 @@ const alpaca = new Alpaca({
 
 log(`🤖 Model: ${MODEL} (via ${GEMINI_BASE_URL})`);
 log(`🔧 Alpaca paper endpoint: ${ALPACA_BASE_URL}`);
+
+// Risk limits are enforced in code, not left to the model's discretion.
+const riskConfig = loadRiskConfig(process.env);
+log(
+  `🛡️ Risk limits: stop-loss -${riskConfig.stopLossPct}%, take-profit +${riskConfig.takeProfitPct}%, ` +
+    `max position ${riskConfig.maxPositionPct}% of equity, cash reserve ${riskConfig.cashReservePct}%, ` +
+    `max drawdown ${riskConfig.maxDrawdownPct}%, max ${riskConfig.maxBuysPerSession} buys/session`
+);
+
+// Session-scoped counters. One process runs exactly one session, so plain
+// module state is sufficient — nothing needs to survive the run.
+let buysThisSession = 0;
+let sessionDrawdownPct = 0;
 
 // ---------------------------------------------------------------------------
 // Retry / backoff helper — a transient 429 (or 5xx) should not crash the run.
@@ -307,6 +328,77 @@ const getPortfolio = async (): Promise<Portfolio> => {
     holdings,
     history,
   };
+};
+
+/** Close an entire position regardless of side or fractional quantity. */
+const closeWholePosition = (symbol: string): Promise<any> =>
+  withRetry(() => alpaca.closePosition(symbol), `Alpaca closePosition ${symbol}`);
+
+/**
+ * Peak equity from Alpaca's own equity curve. The agent keeps no state between
+ * runs (CI checks out fresh each time), so the high-water mark is derived from
+ * the broker rather than stored locally.
+ */
+const getPeakEquity = async (currentEquity: number): Promise<number> => {
+  try {
+    const history: any = await withRetry(
+      () =>
+        alpaca.getPortfolioHistory({
+          period: "3M",
+          timeframe: "1D",
+          extended_hours: false,
+        } as any),
+      "Alpaca getPortfolioHistory"
+    );
+    return peakEquity(history?.equity ?? [], currentEquity);
+  } catch (error) {
+    // Fail open. A history outage must not manufacture a phantom drawdown and
+    // freeze trading; the other position-level limits still apply.
+    log(
+      `⚠️ Portfolio history unavailable (${error}) — treating current equity as the peak, so the drawdown breaker is inactive this session.`
+    );
+    return currentEquity;
+  }
+};
+
+/**
+ * Enforce exits BEFORE the model runs, so stop-loss and take-profit do not
+ * depend on the model choosing to honour them. Returns a summary that is fed
+ * into the model's context — otherwise it would see a position silently
+ * disappear and have no idea why.
+ */
+const runExitSweep = async (): Promise<string> => {
+  const portfolio = await getPortfolio();
+  const peak = await getPeakEquity(portfolio.equity);
+  sessionDrawdownPct = drawdownPct(portfolio.equity, peak);
+
+  log(
+    `🛡️ Equity $${portfolio.equity.toFixed(2)} | peak $${peak.toFixed(
+      2
+    )} | drawdown ${sessionDrawdownPct.toFixed(2)}%`
+  );
+
+  const exits = decideExits(portfolio.positions, riskConfig);
+  if (exits.length === 0) {
+    log("🛡️ Exit sweep: no positions breached stop-loss or take-profit.");
+    return "No positions breached the stop-loss or take-profit thresholds.";
+  }
+
+  const lines: string[] = [];
+  for (const exit of exits) {
+    const label = describeExit(exit);
+    try {
+      await closeWholePosition(exit.ticker);
+      log(`🛡️ ${label} — closed automatically.`);
+      lines.push(`${label} — position closed automatically by the risk engine.`);
+    } catch (error) {
+      log(`❌ ${label} — automatic close FAILED: ${error}`);
+      lines.push(
+        `${label} — AUTOMATIC CLOSE FAILED (${error}). Close this position yourself with the sell tool as your first action.`
+      );
+    }
+  }
+  return lines.join("\n");
 };
 
 /** Alpaca rejects notional orders below $1. */
@@ -697,54 +789,96 @@ const executeTool = async (name: string, args: any): Promise<string> => {
           return `Specify how much ${ticker} to buy: notional (dollar amount, preferred) or shares.`;
         }
 
-        const account = await getAccount();
+        const [account, currentPositions] = await Promise.all([
+          getAccount(),
+          getPositions(),
+        ]);
         const buyingPower = num(account.buying_power);
+        const held = currentPositions.find((p: any) => p.symbol === ticker);
+        const existingPositionValue = held ? Math.abs(num(held.market_value)) : 0;
+
+        // Price the request in dollars so one set of risk rules covers both
+        // the notional and the share-count paths.
+        let quotedPrice: number | undefined;
+        let requestedNotional: number;
+        if (hasNotional) {
+          requestedNotional = Number(args.notional);
+        } else {
+          if (!(Number(args.shares) > 0)) return `Invalid share count for ${ticker}.`;
+          quotedPrice = await getStockPrice(ticker);
+          requestedNotional = Number(args.shares) * quotedPrice;
+        }
+
+        const verdict = vetBuy({
+          ticker,
+          requestedNotional,
+          equity: num(account.portfolio_value),
+          cash: num(account.cash),
+          existingPositionValue,
+          buysThisSession,
+          currentDrawdownPct: sessionDrawdownPct,
+          config: riskConfig,
+        });
+
+        if (!verdict.allowed) {
+          log(`🛡️ Buy blocked for ${ticker}: ${verdict.reason}`);
+          return verdict.reason;
+        }
+        if (verdict.clamped) {
+          log(`🛡️ ${verdict.reason}`);
+        }
+
+        // Only worth an asset lookup once the trade is actually going ahead.
+        const fractionable = await isFractionable(ticker);
 
         // --- Dollar-amount sizing (preferred) --------------------------------
-        if (hasNotional) {
-          const notional = roundTo(Number(args.notional), 2);
-          if (!(notional > 0)) return `Invalid notional amount for ${ticker}.`;
+        if (hasNotional || verdict.clamped) {
+          const notional = roundTo(
+            Math.min(verdict.approvedNotional, buyingPower),
+            2
+          );
           if (notional < MIN_NOTIONAL) {
-            return `Alpaca's minimum order is $${MIN_NOTIONAL.toFixed(
+            return `Not enough buying power for ${ticker} (have $${buyingPower.toFixed(
               2
-            )}; requested $${notional.toFixed(2)} of ${ticker}.`;
-          }
-          if (notional > buyingPower) {
-            return `Not enough buying power for $${notional.toFixed(
-              2
-            )} of ${ticker} (have $${buyingPower.toFixed(2)}).`;
+            )}).`;
           }
 
-          if (await isFractionable(ticker)) {
+          // Surface any risk reduction to the model so it can re-plan the rest
+          // of its session around the smaller fill.
+          const note = verdict.clamped ? `\n${verdict.reason}` : "";
+
+          if (fractionable) {
             const order = await placeOrder(ticker, { notional }, "buy");
+            buysThisSession++;
             log(
               `💰 BUY $${notional.toFixed(2)} of ${ticker} — order ${order.id} (${order.status})`
             );
             return `Submitted BUY $${notional.toFixed(
               2
-            )} of ${ticker} @ market (fractional). Order ${order.id}, status ${order.status}.`;
+            )} of ${ticker} @ market (fractional). Order ${order.id}, status ${order.status}.${note}`;
           }
 
           // Whole-share-only asset: convert the dollar budget into shares.
-          const price = await getStockPrice(ticker);
+          const price = quotedPrice ?? (await getStockPrice(ticker));
           const wholeShares = Math.floor(notional / price);
           if (wholeShares < 1) {
             return `${ticker} does not support fractional trading and one share costs $${price.toFixed(
               2
-            )}, above the $${notional.toFixed(2)} budget. Pick another ticker or raise the amount.`;
+            )}, above the $${notional.toFixed(
+              2
+            )} permitted. Pick another ticker or raise the amount.${note}`;
           }
           const order = await placeOrder(ticker, { qty: wholeShares }, "buy");
+          buysThisSession++;
           log(`💰 BUY ${wholeShares} ${ticker} — order ${order.id} (${order.status})`);
           return `${ticker} is not fractionable, so bought whole shares: submitted BUY ${wholeShares} ${ticker} @ market (~$${(
             wholeShares * price
-          ).toFixed(2)}). Order ${order.id}, status ${order.status}.`;
+          ).toFixed(2)}). Order ${order.id}, status ${order.status}.${note}`;
         }
 
-        // --- Share-count sizing ---------------------------------------------
+        // --- Share-count sizing (unclamped: honour the exact share count) ----
         let shares = Number(args.shares);
-        if (!(shares > 0)) return `Invalid share count for ${ticker}.`;
-
-        if (await isFractionable(ticker)) {
+        if (fractionable) {
           shares = roundTo(shares, 9);
         } else if (!Number.isInteger(shares)) {
           shares = Math.floor(shares);
@@ -753,7 +887,7 @@ const executeTool = async (name: string, args: any): Promise<string> => {
           }
         }
 
-        const price = await getStockPrice(ticker);
+        const price = quotedPrice ?? (await getStockPrice(ticker));
         const cost = shares * price;
         if (buyingPower < cost) {
           return `Not enough buying power for ${shares} ${ticker} (need ~$${cost.toFixed(
@@ -761,6 +895,7 @@ const executeTool = async (name: string, args: any): Promise<string> => {
           )}, have $${buyingPower.toFixed(2)}).`;
         }
         const order = await placeOrder(ticker, { qty: shares }, "buy");
+        buysThisSession++;
         log(`💰 BUY ${shares} ${ticker} — order ${order.id} (${order.status})`);
         return `Submitted BUY ${shares} ${ticker} @ market. Order ${order.id}, status ${order.status}, est. cost $${cost.toFixed(
           2
@@ -865,6 +1000,27 @@ const executeTool = async (name: string, args: any): Promise<string> => {
 const runTradingSession = async (): Promise<void> => {
   log("🚀 Starting Gemini trading session");
 
+  // Enforce exits before the model gets a turn. Stop-loss and take-profit are
+  // not suggestions it can reason its way out of.
+  const exitSummary = await runExitSweep();
+
+  const breakerTripped = sessionDrawdownPct >= riskConfig.maxDrawdownPct;
+  const riskBriefing =
+    `RISK ENGINE REPORT (enforced automatically in code, before this session):\n` +
+    `${exitSummary}\n\n` +
+    `Active limits — these are enforced by code, not by you:\n` +
+    `- Positions are auto-closed at -${riskConfig.stopLossPct}% (stop-loss) or +${riskConfig.takeProfitPct}% (take-profit)\n` +
+    `- No single position may exceed ${riskConfig.maxPositionPct}% of equity; oversized buys are reduced automatically\n` +
+    `- A ${riskConfig.cashReservePct}% cash reserve is held back and cannot be deployed\n` +
+    `- At most ${riskConfig.maxBuysPerSession} buy orders per session\n` +
+    `- Current drawdown from peak equity: ${sessionDrawdownPct.toFixed(2)}% ` +
+    `(new buys are blocked at ${riskConfig.maxDrawdownPct}%)\n` +
+    (breakerTripped
+      ? `\n⚠️ THE DRAWDOWN BREAKER IS ACTIVE. New buys will be rejected this session. ` +
+        `You may still sell, trim, or close positions — focus on reviewing what you hold.\n`
+      : "") +
+    `\nDo not fight these limits or retry a blocked order unchanged — adapt your plan to them.`;
+
   const systemPrompt = readFileSync("system-prompt.md", "utf-8");
   const etTime = new Date().toLocaleString("en-US", {
     timeZone: "America/New_York",
@@ -875,7 +1031,7 @@ const runTradingSession = async (): Promise<void> => {
     { role: "system", content: systemPrompt },
     {
       role: "user",
-      content: `It's ${etTime} (US Eastern). The US stock market is OPEN for trading right now, so real-time quotes and order execution are available. Time for your trading analysis! Use the think tool first, then review your portfolio and net worth, check prices for tickers you're interested in, and call get_stock_news for any ticker you're considering to factor in recent financial news + sentiment before you trade. Then execute trades to grow the portfolio. Good luck! 📈`,
+      content: `It's ${etTime} (US Eastern). The US stock market is OPEN for trading right now, so real-time quotes and order execution are available.\n\n${riskBriefing}\n\nTime for your trading analysis! Use the think tool first, then review your portfolio and net worth, check prices for tickers you're interested in, and call get_stock_news for any ticker you're considering to factor in recent financial news + sentiment before you trade. Then execute trades to grow the portfolio. Good luck! 📈`,
     },
   ];
 
