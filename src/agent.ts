@@ -214,8 +214,30 @@ const getOrderHistory = (limit = 100): Promise<any[]> =>
     "Alpaca getOrders"
   );
 
+// Alpaca returns every numeric field as a string, and some (e.g. current_price)
+// can be missing for stale or illiquid symbols. Parse defensively so a bad
+// value can never propagate as NaN into the agent's view of the portfolio.
+const num = (value: any, fallback = 0): number => {
+  const parsed = parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+interface Position {
+  ticker: string;
+  shares: number;
+  side: "long" | "short";
+  avgEntryPrice: number;
+  currentPrice: number;
+  marketValue: number;
+  unrealizedPl: number;
+  /** Percent, already scaled from Alpaca's fractional form (0.077 -> 7.7). */
+  unrealizedPlPct: number;
+}
+
 interface Portfolio {
   cash: number;
+  equity: number;
+  positions: Position[];
   holdings: Record<string, number>;
   history: Array<{
     date: string;
@@ -235,10 +257,31 @@ const getPortfolio = async (): Promise<Portfolio> => {
   ]);
 
   const holdings: Record<string, number> = {};
-  positions.forEach((position: any) => {
-    const qty = parseFloat(position.qty);
-    if (qty !== 0) holdings[position.symbol] = qty;
-  });
+  const openPositions: Position[] = positions
+    .map((position: any): Position => {
+      const shares = num(position.qty);
+      if (shares !== 0) holdings[position.symbol] = shares;
+
+      const marketValue = num(position.market_value);
+      // Recover the mark from market value when Alpaca omits current_price,
+      // so the agent still sees a live price rather than $0.00.
+      const currentPrice =
+        num(position.current_price) ||
+        (shares !== 0 ? Math.abs(marketValue / shares) : 0);
+
+      return {
+        ticker: position.symbol,
+        shares,
+        side: shares < 0 ? "short" : "long",
+        avgEntryPrice: num(position.avg_entry_price),
+        currentPrice,
+        marketValue,
+        unrealizedPl: num(position.unrealized_pl),
+        // Alpaca reports this as a fraction: 0.0772 means +7.72%.
+        unrealizedPlPct: num(position.unrealized_plpc) * 100,
+      };
+    })
+    .filter((position: Position) => position.shares !== 0);
 
   const history = orders
     .filter((order: any) => order.filled_at)
@@ -257,7 +300,13 @@ const getPortfolio = async (): Promise<Portfolio> => {
         new Date(a.date).getTime() - new Date(b.date).getTime()
     );
 
-  return { cash: parseFloat(account.cash), holdings, history };
+  return {
+    cash: num(account.cash),
+    equity: num(account.portfolio_value),
+    positions: openPositions,
+    holdings,
+    history,
+  };
 };
 
 const placeOrder = (
@@ -417,7 +466,8 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "get_portfolio",
-      description: "Get current cash, holdings, and trade history.",
+      description:
+        "Get current cash, total equity, and every open position with its average entry price, current price, market value, and unrealized profit/loss in both dollars and percent — plus recent trade history. Use the per-position unrealized P&L to decide what to take profits on and what to cut.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -500,6 +550,19 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
 // Tool execution
 // ---------------------------------------------------------------------------
 
+// Always render P&L with an explicit +/- so the model can never misread a
+// gain as a loss (or vice versa) from formatting alone.
+const signedMoney = (value: number): string =>
+  `${value < 0 ? "-" : "+"}$${Math.abs(value).toFixed(2)}`;
+
+const signedPct = (value: number): string =>
+  `${value < 0 ? "-" : "+"}${Math.abs(value).toFixed(2)}%`;
+
+// Plain amount, no forced sign — but keeps "-$480.00" readable for the
+// negative market value a short position carries.
+const money = (value: number): string =>
+  `${value < 0 ? "-" : ""}$${Math.abs(value).toFixed(2)}`;
+
 const executeTool = async (name: string, args: any): Promise<string> => {
   log(`🛠️  Tool: ${name}(${JSON.stringify(args)})`);
   try {
@@ -512,10 +575,25 @@ const executeTool = async (name: string, args: any): Promise<string> => {
 
       case "get_portfolio": {
         const p = await getPortfolio();
-        const holdings =
-          Object.entries(p.holdings)
-            .map(([t, s]) => `  - ${t}: ${s} shares`)
+
+        const positions =
+          p.positions
+            .map(
+              (pos) =>
+                `  - ${pos.ticker}: ${pos.shares} shares (${pos.side})\n` +
+                `      avg entry $${pos.avgEntryPrice.toFixed(2)} → now $${pos.currentPrice.toFixed(
+                  2
+                )} | value ${money(pos.marketValue)} | unrealized ${signedMoney(
+                  pos.unrealizedPl
+                )} (${signedPct(pos.unrealizedPlPct)})`
+            )
             .join("\n") || "  (none)";
+
+        const totalUnrealized = p.positions.reduce(
+          (sum, pos) => sum + pos.unrealizedPl,
+          0
+        );
+
         const history =
           p.history
             .slice(-15)
@@ -524,7 +602,14 @@ const executeTool = async (name: string, args: any): Promise<string> => {
                 `  - ${h.date} ${h.type} ${h.shares} ${h.ticker} @ $${h.price}`
             )
             .join("\n") || "  (none)";
-        return `Cash: $${p.cash.toFixed(2)}\nHoldings:\n${holdings}\n\nRecent trades:\n${history}`;
+
+        return (
+          `Cash: $${p.cash.toFixed(2)}\n` +
+          `Equity (cash + positions): $${p.equity.toFixed(2)}\n\n` +
+          `Open positions (${p.positions.length}):\n${positions}\n\n` +
+          `Total unrealized P&L: ${signedMoney(totalUnrealized)}\n\n` +
+          `Recent trades:\n${history}`
+        );
       }
 
       case "get_net_worth": {
