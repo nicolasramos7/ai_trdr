@@ -1,14 +1,37 @@
 name: Trading agent
 
-# 13 sessions per trading day, every ~30 min, 9:41–15:41 ET.
-# Timezone-aware (GitHub added `timezone:` in March 2026) — handles EDT/EST
-# automatically, so no more manual UTC shifting in winter.
-# Odd minutes (:11, :41) avoid GitHub's :00/:15/:30 cron congestion.
+# 4 sessions per trading day. Timezone-aware (GitHub added `timezone:` in March
+# 2026) — handles EDT/EST automatically, so no manual UTC shifting in winter.
+#
+# Sizing: GitHub's scheduler is best effort. Observed delivery is ~1 run/hour
+# with the rest silently dropped, each arriving 20-40 min late. Asking for more
+# than ~1/hour buys nothing, and every extra session is another independent
+# chance for a stateless agent to churn a position — on fractional MARKET
+# orders the bid/ask spread is the dominant cost, since Alpaca charges no
+# commission. Fewer, better-placed sessions beat more of them.
+#
+# Placement: each slot is chosen so the whole delivery window [T, T+40min] is
+# tradeable, not just T.
+#   9:50  -> 9:50-10:30  overnight and pre-market news digested, opening
+#                        spreads settled; never fires before the 9:30 open.
+#   11:20 -> 11:20-12:00 late morning, still liquid.
+#   13:35 -> 13:35-14:15 afternoon, after the midday lull. The long 11:20->13:35
+#                        gap deliberately skips ~12:00-13:30, the thinnest
+#                        liquidity and widest spreads of the session.
+#   14:55 -> 14:55-15:35 last look before the ~19h overnight hole, with buffer
+#                        to stay clear of closing-auction imbalance and to
+#                        never land after the 16:00 close on a worst-case delay.
+# Slots are >=80 min apart to stay under the ~1/hour delivery throttle, and off
+# :00/:15/:30 to avoid GitHub's own cron congestion.
 on:
   schedule:
-    - cron: "41 9 * * 1-5"
+    - cron: "50 9 * * 1-5"
       timezone: "America/New_York"
-    - cron: "11,41 10-15 * * 1-5"
+    - cron: "20 11 * * 1-5"
+      timezone: "America/New_York"
+    - cron: "35 13 * * 1-5"
+      timezone: "America/New_York"
+    - cron: "55 14 * * 1-5"
       timezone: "America/New_York"
   workflow_dispatch:
 
