@@ -8,11 +8,31 @@ import {
   loadRiskConfig,
   peakEquity,
   vetBuy,
+  vetSell,
+  hoursSinceLastSell,
   type BuyRequest,
+  type FillRecord,
   type RiskConfig,
+  type SellRequest,
 } from "../src/risk.js";
 
-const config: RiskConfig = DEFAULT_RISK_CONFIG;
+/**
+ * Behaviour is asserted against an explicit config, not against whatever the
+ * shipped defaults happen to be. Retuning a default is a trading decision; it
+ * should not silently rewrite what the engine is proven to do.
+ */
+const config: RiskConfig = {
+  stopLossPct: 7,
+  takeProfitPct: 15,
+  maxPositionPct: 25,
+  cashReservePct: 10,
+  maxDrawdownPct: 15,
+  maxBuysPerSession: 4,
+  minRebuyHours: 24,
+  minSharePrice: 10,
+  minSellNotional: 5,
+  peakLookbackDays: 30,
+};
 
 /** A buy request that passes every rule, so each test varies one thing. */
 const baseRequest = (overrides: Partial<BuyRequest> = {}): BuyRequest => ({
@@ -179,19 +199,64 @@ describe("vetBuy", () => {
     expect(vetBuy(baseRequest({ requestedNotional: -5 })).allowed).toBe(false);
   });
 
-  describe("drawdown circuit breaker", () => {
-    it("blocks buys at or beyond the limit", () => {
-      const verdict = vetBuy(baseRequest({ currentDrawdownPct: 15 }));
+  describe("drawdown de-risking", () => {
+    it("halves the position cap at the limit instead of blocking buys", () => {
+      // 25% of $100 normally; $12.50 once de-risked.
+      const verdict = vetBuy(
+        baseRequest({ currentDrawdownPct: 15, requestedNotional: 25 })
+      );
+      expect(verdict.allowed).toBe(true);
+      expect(verdict.approvedNotional).toBe(12.5);
+      expect(verdict.clamped).toBe(true);
+      expect(verdict.reason).toMatch(/drawdown/i);
+    });
+
+    it("leaves sizing untouched just inside the limit", () => {
+      const verdict = vetBuy(
+        baseRequest({ currentDrawdownPct: 14.9, requestedNotional: 25 })
+      );
+      expect(verdict.approvedNotional).toBe(25);
+      expect(verdict.clamped).toBe(false);
+    });
+
+    it("still permits a buy in a deep drawdown, so the account can recover", () => {
+      // The old behaviour denied outright here, which made drawdown an
+      // absorbing state: recovery needs exposure, and there was no way to get any.
+      const verdict = vetBuy(baseRequest({ currentDrawdownPct: 40, requestedNotional: 10 }));
+      expect(verdict.allowed).toBe(true);
+      expect(verdict.approvedNotional).toBe(10);
+    });
+  });
+
+  describe("penny-stock filter", () => {
+    it("blocks a sub-minimum share price", () => {
+      const verdict = vetBuy(baseRequest({ ticker: "AMC", sharePrice: 2.53 }));
       expect(verdict.allowed).toBe(false);
-      expect(verdict.reason).toContain("RISK HALT");
+      expect(verdict.reason).toContain("minimum share price");
     });
 
-    it("still allows buys just inside the limit", () => {
-      expect(vetBuy(baseRequest({ currentDrawdownPct: 14.9 })).allowed).toBe(true);
+    it("allows a large-cap price", () => {
+      expect(vetBuy(baseRequest({ sharePrice: 220 })).allowed).toBe(true);
     });
 
-    it("tells the agent it may still sell", () => {
-      expect(vetBuy(baseRequest({ currentDrawdownPct: 20 })).reason).toMatch(/still sell/i);
+    it("skips the check when no price is supplied", () => {
+      expect(vetBuy(baseRequest({ sharePrice: undefined })).allowed).toBe(true);
+    });
+  });
+
+  describe("re-buy cooldown", () => {
+    it("blocks buying back a name sold hours ago", () => {
+      const verdict = vetBuy(baseRequest({ ticker: "F", hoursSinceLastSell: 3 }));
+      expect(verdict.allowed).toBe(false);
+      expect(verdict.reason).toMatch(/cannot re-buy/i);
+    });
+
+    it("allows a re-buy once the cooldown has elapsed", () => {
+      expect(vetBuy(baseRequest({ hoursSinceLastSell: 25 })).allowed).toBe(true);
+    });
+
+    it("does not apply to a name that was never sold", () => {
+      expect(vetBuy(baseRequest({ hoursSinceLastSell: undefined })).allowed).toBe(true);
     });
   });
 
@@ -290,5 +355,71 @@ describe("vetBuy", () => {
     const verdict = vetBuy(baseRequest({ requestedNotional: 1 }));
     expect(verdict.allowed).toBe(true);
     expect(verdict.approvedNotional).toBeGreaterThanOrEqual(MIN_NOTIONAL);
+  });
+});
+
+describe("vetSell", () => {
+  const sell = (overrides: Partial<SellRequest> = {}): SellRequest => ({
+    ticker: "GOOG",
+    notional: 10,
+    positionValue: 22,
+    config,
+    ...overrides,
+  });
+
+  it("allows a meaningful trim", () => {
+    expect(vetSell(sell()).allowed).toBe(true);
+  });
+
+  it("rejects the dust trim seen in the logs", () => {
+    // 0.005 shares of a $350 stock: $1.75 against a $22 position.
+    const verdict = vetSell(sell({ notional: 1.75 }));
+    expect(verdict.allowed).toBe(false);
+    expect(verdict.reason).toContain("minimum");
+  });
+
+  it("always permits a full exit, however small the position", () => {
+    const verdict = vetSell(sell({ notional: 1.2, positionValue: 1.2 }));
+    expect(verdict.allowed).toBe(true);
+    expect(verdict.reason).toMatch(/full exit/i);
+  });
+
+  it("treats a sub-cent shortfall as a full exit, not a blocked trim", () => {
+    expect(vetSell(sell({ notional: 2.995, positionValue: 3 })).allowed).toBe(true);
+  });
+
+  it("rejects a non-positive amount", () => {
+    expect(vetSell(sell({ notional: 0 })).allowed).toBe(false);
+  });
+});
+
+describe("hoursSinceLastSell", () => {
+  const now = new Date("2026-08-12T16:00:00Z");
+  const fills: FillRecord[] = [
+    { ticker: "F", side: "sell", date: "2026-08-12T13:00:00Z" },
+    { ticker: "F", side: "sell", date: "2026-08-10T13:00:00Z" },
+    { ticker: "NVDA", side: "buy", date: "2026-08-12T15:00:00Z" },
+  ];
+
+  it("measures from the most recent sell", () => {
+    expect(hoursSinceLastSell("F", fills, now)).toBe(3);
+  });
+
+  it("ignores buys", () => {
+    expect(hoursSinceLastSell("NVDA", fills, now)).toBeUndefined();
+  });
+
+  it("is undefined for an untouched ticker", () => {
+    expect(hoursSinceLastSell("MSFT", fills, now)).toBeUndefined();
+  });
+
+  it("matches tickers case-insensitively", () => {
+    expect(hoursSinceLastSell("f", fills, now)).toBe(3);
+  });
+
+  it("ignores unparseable timestamps", () => {
+    expect(
+      hoursSinceLastSell("X", [{ ticker: "X", side: "sell", date: "not-a-date" }], now)
+    ).toBeUndefined();
   });
 });

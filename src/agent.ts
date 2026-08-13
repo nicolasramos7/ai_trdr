@@ -17,9 +17,12 @@ import {
   decideExits,
   describeExit,
   drawdownPct,
+  hoursSinceLastSell,
   loadRiskConfig,
   peakEquity,
   vetBuy,
+  vetSell,
+  type FillRecord,
 } from "./risk.js";
 
 // ---------------------------------------------------------------------------
@@ -105,6 +108,65 @@ log(
 let buysThisSession = 0;
 let sessionDrawdownPct = 0;
 
+/**
+ * Model-usage accounting.
+ *
+ * Nothing used to record what a session cost, which made "the agent ran out of
+ * Gemini quota by the afternoon" impossible to diagnose: the logs showed the
+ * failure but never the consumption that led to it. Every completion now adds
+ * to this, and the totals are logged at the end of the session.
+ */
+const modelUsage = { requests: 0, promptTokens: 0, completionTokens: 0 };
+
+/**
+ * Reasoning effort for the tool-calling loop.
+ *
+ * Gemini 2.5 Flash thinks by default, and thinking tokens are billed as output
+ * on every turn — including the turns that do nothing but route a tool call,
+ * where the model is choosing between "call get_portfolio" and "call
+ * get_stock_price" and needs no deliberation at all. `low` keeps deliberation
+ * for the decision turns without paying for it eight times a session; `none`
+ * disables it outright.
+ */
+const REASONING_EFFORT = process.env.GEMINI_REASONING_EFFORT || "low";
+
+/**
+ * Hard ceiling on model requests per session, independent of the turn limit.
+ *
+ * Sized against the Gemini FREE tier, which is far tighter than it looks:
+ * 2.5 Flash allows ~5 requests per MINUTE and only a few dozen per DAY. Four
+ * sessions must therefore share a daily budget of roughly 25 requests, so a
+ * session gets 5 — with the rest held back as headroom, because a session that
+ * overruns does not fail alone: it steals the quota belonging to the 15:00 ET
+ * session, the one that positions the book before an 18-hour overnight gap.
+ *
+ * Raise this only alongside a paid tier.
+ */
+const MAX_MODEL_REQUESTS = Number(process.env.MAX_MODEL_REQUESTS) || 5;
+
+/**
+ * Minimum spacing between model requests, to stay under the per-minute limit.
+ *
+ * The loop used to fire every turn back-to-back — six requests in about twenty
+ * seconds against a 5/minute ceiling. The overshoot came back as 429s, which
+ * were then RETRIED, and on this tier a retry is charged against the same daily
+ * quota it is trying to recover from. Pacing costs a minute of wall clock per
+ * session and removes the entire failure mode.
+ */
+const MIN_REQUEST_INTERVAL_MS =
+  Number(process.env.MIN_REQUEST_INTERVAL_MS) || 12_500;
+
+/**
+ * Model to fall back to when the primary's daily quota is gone.
+ *
+ * Each model carries its OWN quota pool, so a Flash exhaustion does not imply a
+ * Flash-Lite exhaustion. A cheaper model still reading the news beats the last
+ * session of the day not running at all.
+ */
+const FALLBACK_MODEL = process.env.FALLBACK_MODEL || "gemini-2.5-flash-lite";
+
+let lastRequestAt = 0;
+
 // ---------------------------------------------------------------------------
 // Retry / backoff helper — a transient 429 (or 5xx) should not crash the run.
 // ---------------------------------------------------------------------------
@@ -112,11 +174,50 @@ let sessionDrawdownPct = 0;
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Hold the floor between model requests so the per-minute limit is never hit. */
+const paceRequest = async (): Promise<void> => {
+  const waitMs = lastRequestAt + MIN_REQUEST_INTERVAL_MS - Date.now();
+  if (waitMs > 0) {
+    log(`⏳ Pacing ${Math.round(waitMs / 1000)}s to stay under the per-minute limit.`);
+    await sleep(waitMs);
+  }
+  lastRequestAt = Date.now();
+};
+
 const getStatusCode = (error: any): number | undefined => {
   if (typeof error?.status === "number") return error.status;
   if (typeof error?.response?.status === "number") return error.response.status;
   const match = String(error?.message || "").match(/\b(\d{3})\b/);
   return match ? parseInt(match[1], 10) : undefined;
+};
+
+/**
+ * Gemini returns 429 RESOURCE_EXHAUSTED for two completely different
+ * conditions, and treating them alike is expensive:
+ *
+ *   - a PER-MINUTE limit, which clears on its own in seconds; retrying is right.
+ *   - a PER-DAY quota, which does not clear until midnight Pacific. Retrying is
+ *     not just futile, it BURNS MORE OF THE SAME EXHAUSTED QUOTA — every retry
+ *     is another counted request — and sleeps through minutes of the job's
+ *     10-minute budget to do it.
+ *
+ * The daily case is identifiable: the violation names a "PerDay" quota metric.
+ */
+const isDailyQuotaExhausted = (error: any): boolean =>
+  /perday|per day|requests per day|quota_?metric.*day/i.test(
+    String(error?.message || "") + JSON.stringify(error?.error ?? {})
+  );
+
+/**
+ * Seconds Google asks us to wait, when it says so. Honouring the server's own
+ * retryDelay beats guessing with exponential backoff: it is usually far shorter
+ * than the 2/4/8/16s ladder, which wastes wall-clock inside a capped CI job.
+ */
+const serverRetryDelayMs = (error: any): number | undefined => {
+  const match = String(error?.message || "").match(
+    /"?retryDelay"?\s*[:=]\s*"?(\d+(?:\.\d+)?)s/i
+  );
+  return match ? Math.ceil(parseFloat(match[1]) * 1000) : undefined;
 };
 
 const withRetry = async <T>(
@@ -132,11 +233,24 @@ const withRetry = async <T>(
     } catch (error: any) {
       lastError = error;
       const status = getStatusCode(error);
+
+      // A daily quota is not a transient condition. Fail immediately rather
+      // than spending four more requests and half a minute confirming it.
+      if (status === 429 && isDailyQuotaExhausted(error)) {
+        log(
+          `🛑 ${label}: DAILY Gemini quota exhausted. Not retrying — retries would consume ` +
+            `more of the same quota. This session is over; the next one runs after the quota resets.`
+        );
+        throw error;
+      }
+
       const isRetryable =
         status === 429 || (status !== undefined && status >= 500 && status < 600);
 
       if (isRetryable && attempt < retries - 1) {
-        const waitMs = baseDelay * Math.pow(2, attempt) + Math.random() * 1000;
+        const waitMs =
+          serverRetryDelayMs(error) ??
+          baseDelay * Math.pow(2, attempt) + Math.random() * 1000;
         const reason = status === 429 ? "rate limit (429)" : `server error (${status})`;
         log(
           `⚠️ ${label} hit a ${reason}. Backing off ${Math.round(
@@ -326,6 +440,31 @@ const getPortfolio = async (): Promise<Portfolio> => {
   };
 };
 
+/**
+ * Hours since `ticker` was last sold, from the broker's own fill history.
+ *
+ * The agent is stateless between runs, so the anti-churn cooldown cannot rely
+ * on anything the process remembers — but Alpaca already knows what was sold
+ * and when, which is a more trustworthy source anyway.
+ */
+const recentSellAgeHours = async (ticker: string): Promise<number | undefined> => {
+  try {
+    const orders = await getOrderHistory(100);
+    const fills: FillRecord[] = orders
+      .filter((order: any) => order.filled_at)
+      .map((order: any) => ({
+        ticker: order.symbol,
+        side: order.side === "buy" ? ("buy" as const) : ("sell" as const),
+        date: order.filled_at,
+      }));
+    return hoursSinceLastSell(ticker, fills);
+  } catch (error) {
+    // Fail open: an unreachable history must not block a legitimate buy.
+    log(`⚠️ Could not check re-buy cooldown for ${ticker}: ${error}`);
+    return undefined;
+  }
+};
+
 /** Close an entire position regardless of side or fractional quantity. */
 const closeWholePosition = (symbol: string): Promise<any> =>
   withRetry(() => alpaca.closePosition(symbol), `Alpaca closePosition ${symbol}`);
@@ -340,7 +479,10 @@ const getPeakEquity = async (currentEquity: number): Promise<number> => {
     const history: any = await withRetry(
       () =>
         alpaca.getPortfolioHistory({
-          period: "3M",
+          // A bounded window, not the whole account history. An unbounded peak
+          // is permanent: one good week suppresses position sizing for months
+          // after it has stopped saying anything about the current market.
+          period: `${Math.max(1, Math.round(riskConfig.peakLookbackDays))}D`,
           timeframe: "1D",
           extended_hours: false,
         } as any),
@@ -524,31 +666,34 @@ const getStockNews = async (symbol: string): Promise<string> => {
       return `No recent news found for ${ticker} in the last 7 days.`;
     }
 
-    const articles = data.slice(0, 8);
-    let aggregate = 0;
-    const lines = articles.map((a: any) => {
-      const headline = a.headline || "";
-      const summary = (a.summary || "").trim();
-      const score = scoreSentiment(`${headline} ${summary}`);
-      aggregate += score;
-      const date = a.datetime
+    // Score sentiment over the full text of a wider sample, but SEND only the
+    // headlines of the top few. The article bodies and URLs were the single
+    // largest block of tokens in the session — resent on every subsequent turn —
+    // and the model cannot open a URL, so their only effect was cost.
+    const scored = data.slice(0, 10).map((a: any) => ({
+      headline: String(a.headline || ""),
+      source: a.source || "?",
+      date: a.datetime
         ? new Date(a.datetime * 1000).toISOString().slice(0, 10)
-        : "";
-      const shortSummary =
-        summary.length > 240 ? `${summary.slice(0, 240)}…` : summary;
-      return `• [${sentimentLabel(score)} ${score.toFixed(
-        2
-      )}] ${headline} (${a.source || "?"}, ${date})\n  ${shortSummary}\n  ${
-        a.url || ""
-      }`;
-    });
+        : "",
+      score: scoreSentiment(`${a.headline || ""} ${(a.summary || "").trim()}`),
+    }));
 
-    const overall = aggregate / articles.length;
+    const aggregate = scored.reduce((sum, a) => sum + a.score, 0);
+    const articles = scored.slice(0, 4);
+    const lines = articles.map(
+      (a) =>
+        `• [${sentimentLabel(a.score)} ${a.score.toFixed(2)}] ${a.headline} (${
+          a.source
+        }, ${a.date})`
+    );
+
+    const overall = aggregate / scored.length;
     return `Recent news for ${ticker} (overall sentiment: ${sentimentLabel(
       overall
-    )} ${overall.toFixed(2)}, from ${articles.length} article(s)):\n\n${lines.join(
-      "\n\n"
-    )}`;
+    )} ${overall.toFixed(2)}, across ${scored.length} article(s); top ${
+      articles.length
+    } headlines):\n${lines.join("\n")}`;
   } catch (error) {
     log(`⚠️ Finnhub news error for ${ticker}: ${error}`);
     return `News error for ${ticker}.`;
@@ -560,35 +705,7 @@ const getStockNews = async (symbol: string): Promise<string> => {
 // OpenAI-compatible endpoint).
 // ---------------------------------------------------------------------------
 
-const tickerParam = {
-  type: "object",
-  properties: {
-    ticker: { type: "string", description: "Stock ticker symbol, e.g. AAPL" },
-    shares: { type: "number", description: "Number of shares (positive)" },
-  },
-  required: ["ticker", "shares"],
-} as const;
-
 const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
-  {
-    type: "function",
-    function: {
-      name: "think",
-      description:
-        "Record step-by-step reasoning. Use this before taking any other action.",
-      parameters: {
-        type: "object",
-        properties: {
-          thought_process: {
-            type: "array",
-            items: { type: "string" },
-            description: "Ordered list of reasoning steps",
-          },
-        },
-        required: ["thought_process"],
-      },
-    },
-  },
   {
     type: "function",
     function: {
@@ -610,14 +727,22 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "get_stock_price",
-      description: "Get the current market price for a ticker.",
+      description:
+        "Get current market prices. Pass ALL tickers you are considering in one call.",
       parameters: {
         type: "object",
         properties: {
-          ticker: { type: "string", description: "Stock ticker symbol" },
+          tickers: {
+            type: "array",
+            items: { type: "string" },
+            description: "Ticker symbols to price, e.g. [\"NVDA\", \"MSFT\"]",
+          },
+          ticker: {
+            type: "string",
+            description: "Single ticker symbol (use `tickers` for more than one)",
+          },
         },
-        required: ["ticker"],
-      },
+      } as any,
     },
   },
   {
@@ -650,25 +775,27 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: "sell",
       description:
-        "Sell shares of a stock you own at market price (Alpaca paper). Fractional quantities are allowed. To close a position entirely, pass the exact share count shown by get_portfolio.",
-      parameters: tickerParam as any,
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "short_sell",
-      description:
-        "Short sell shares (bet on a decline). Requires >= $40,000 account equity. Unlimited loss potential.",
-      parameters: tickerParam as any,
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "cover_short",
-      description: "Cover (close) an existing short position by buying shares back.",
-      parameters: tickerParam as any,
+        "Sell a stock you own at market price (Alpaca paper). To EXIT a position completely — the usual case — pass close_all: true and nothing else; do not try to echo back a fractional share count. To trim part of a position, pass `notional` (a DOLLAR AMOUNT, preferred) or `shares`. Minimum $5 per partial sell: smaller trims pay a full spread to change nothing.",
+      parameters: {
+        type: "object",
+        properties: {
+          ticker: { type: "string", description: "Stock ticker symbol, e.g. AAPL" },
+          close_all: {
+            type: "boolean",
+            description:
+              "Close the entire position. Preferred way to exit — needs no share count.",
+          },
+          notional: {
+            type: "number",
+            description: "Dollar amount to sell for a partial trim, e.g. 12.50.",
+          },
+          shares: {
+            type: "number",
+            description: "Share count to sell. Use notional or close_all instead where possible.",
+          },
+        },
+        required: ["ticker"],
+      } as any,
     },
   },
   {
@@ -712,12 +839,6 @@ const executeTool = async (name: string, args: any): Promise<string> => {
   log(`🛠️  Tool: ${name}(${JSON.stringify(args)})`);
   try {
     switch (name) {
-      case "think": {
-        const thoughts: string[] = args.thought_process || [];
-        thoughts.forEach((t) => log(`🧠 ${t}`));
-        return `Recorded ${thoughts.length} reasoning step(s).`;
-      }
-
       case "get_portfolio": {
         const p = await getPortfolio();
 
@@ -766,8 +887,29 @@ const executeTool = async (name: string, args: any): Promise<string> => {
       }
 
       case "get_stock_price": {
-        const price = await getStockPrice(args.ticker);
-        return `${String(args.ticker).toUpperCase()}: $${price}`;
+        // Accept a list or a single ticker. The prompt has always told the model
+        // to batch its price lookups; until now the schema made that impossible,
+        // so every candidate cost a separate turn.
+        const requested: string[] = Array.isArray(args.tickers)
+          ? args.tickers
+          : args.ticker
+            ? [args.ticker]
+            : [];
+        const tickers = [
+          ...new Set(requested.map((t) => String(t).toUpperCase()).filter(Boolean)),
+        ];
+        if (tickers.length === 0) return "No tickers supplied.";
+
+        const quotes = await Promise.all(
+          tickers.map(async (ticker) => {
+            try {
+              return `${ticker}: $${await getStockPrice(ticker)}`;
+            } catch (error) {
+              return `${ticker}: price unavailable (${error})`;
+            }
+          })
+        );
+        return quotes.join("\n");
       }
 
       case "buy": {
@@ -790,15 +932,18 @@ const executeTool = async (name: string, args: any): Promise<string> => {
         const held = currentPositions.find((p: any) => p.symbol === ticker);
         const existingPositionValue = held ? Math.abs(num(held.market_value)) : 0;
 
+        // Every buy is now priced, whether or not sizing needs it: the
+        // penny-stock filter cannot run without a share price, and the sub-$10
+        // names are exactly the ones this account must not be trading.
+        const quotedPrice = await getStockPrice(ticker);
+
         // Price the request in dollars so one set of risk rules covers both
         // the notional and the share-count paths.
-        let quotedPrice: number | undefined;
         let requestedNotional: number;
         if (hasNotional) {
           requestedNotional = Number(args.notional);
         } else {
           if (!(Number(args.shares) > 0)) return `Invalid share count for ${ticker}.`;
-          quotedPrice = await getStockPrice(ticker);
           requestedNotional = Number(args.shares) * quotedPrice;
         }
 
@@ -810,6 +955,8 @@ const executeTool = async (name: string, args: any): Promise<string> => {
           existingPositionValue,
           buysThisSession,
           currentDrawdownPct: sessionDrawdownPct,
+          hoursSinceLastSell: await recentSellAgeHours(ticker),
+          sharePrice: quotedPrice,
           config: riskConfig,
         });
 
@@ -897,13 +1044,32 @@ const executeTool = async (name: string, args: any): Promise<string> => {
 
       case "sell": {
         const ticker = String(args.ticker).toUpperCase();
-        let shares = Number(args.shares);
-        if (!(shares > 0)) return `Invalid share count for ${ticker}.`;
 
         const positions = await getPositions();
         const position = positions.find((p: any) => p.symbol === ticker);
         const owned = position ? num(position.qty) : 0;
         if (owned <= 0) return `No long position in ${ticker} to sell.`;
+        const positionValue = Math.abs(num(position.market_value));
+
+        // A full exit goes through Alpaca's own closePosition, which needs no
+        // share count at all. Making the model echo back a nine-decimal
+        // fractional quantity to close a position was an invitation to get the
+        // magnitude wrong — and it did, repeatedly.
+        if (args.close_all === true) {
+          const order = await closeWholePosition(ticker);
+          log(`💸 CLOSE ${ticker} (${owned} shares) — order ${order?.id ?? "n/a"}`);
+          return `Submitted full exit of ${ticker} (${owned} shares, ~$${positionValue.toFixed(
+            2
+          )}) @ market.`;
+        }
+
+        const hasNotional = args.notional !== undefined && args.notional !== null;
+        const price = await getStockPrice(ticker);
+
+        let shares = hasNotional ? Number(args.notional) / price : Number(args.shares);
+        if (!(shares > 0)) {
+          return `Specify how much ${ticker} to sell: close_all, notional (dollars), or shares.`;
+        }
 
         // Snap a near-exact request to the true position size. Fractional
         // quantities don't round-trip cleanly through JSON and display
@@ -914,7 +1080,23 @@ const executeTool = async (name: string, args: any): Promise<string> => {
         if (Math.abs(shares - owned) <= exitTolerance) {
           shares = owned;
         } else if (shares > owned) {
-          return `Not enough shares of ${ticker} to sell (own ${owned}).`;
+          return `Not enough shares of ${ticker} to sell (own ${owned}, worth $${positionValue.toFixed(
+            2
+          )}). Pass close_all: true to exit the whole position.`;
+        }
+
+        // Reject trivial trims. The buy path has enforced a minimum order size
+        // from the start; the sell path had none, which is how $1.75 sells of a
+        // $22 position reached the broker.
+        const sellVerdict = vetSell({
+          ticker,
+          notional: shares * price,
+          positionValue,
+          config: riskConfig,
+        });
+        if (!sellVerdict.allowed) {
+          log(`🛡️ Sell blocked for ${ticker}: ${sellVerdict.reason}`);
+          return sellVerdict.reason;
         }
 
         if (!Number.isInteger(shares) && !(await isFractionable(ticker))) {
@@ -923,55 +1105,11 @@ const executeTool = async (name: string, args: any): Promise<string> => {
         }
         shares = roundTo(shares, 9);
 
-        const price = await getStockPrice(ticker);
         const order = await placeOrder(ticker, { qty: shares }, "sell");
         log(`💸 SELL ${shares} ${ticker} — order ${order.id} (${order.status})`);
         return `Submitted SELL ${shares} ${ticker} @ market. Order ${order.id}, status ${order.status}, est. proceeds $${(
           shares * price
         ).toFixed(2)}.`;
-      }
-
-      case "short_sell": {
-        const ticker = String(args.ticker).toUpperCase();
-        const shares = Number(args.shares);
-        if (!(shares > 0)) return `Invalid share count for ${ticker}.`;
-        const account = await getAccount();
-        const equity = parseFloat(account.portfolio_value);
-        const buyingPower = parseFloat(account.buying_power);
-        if (equity < 40000) {
-          return `Account equity $${equity.toFixed(
-            2
-          )} is below the $40,000 minimum required to short on Alpaca.`;
-        }
-        const price = await getStockPrice(ticker);
-        const orderValue = shares * price;
-        if (buyingPower < orderValue * 0.5) {
-          return `Insufficient buying power for a short (need ~$${(
-            orderValue * 0.5
-          ).toFixed(2)}, have $${buyingPower.toFixed(2)}).`;
-        }
-        // Shorts are whole-share only — Alpaca does not support fractional or
-        // notional sizing on the short side.
-        const order = await placeOrder(ticker, { qty: Math.floor(shares) }, "sell");
-        log(`📉 SHORT ${shares} ${ticker} — order ${order.id} (${order.status})`);
-        return `Submitted SHORT SELL ${shares} ${ticker} @ market. Order ${order.id}, status ${order.status}. WARNING: unlimited loss potential.`;
-      }
-
-      case "cover_short": {
-        const ticker = String(args.ticker).toUpperCase();
-        const shares = Number(args.shares);
-        if (!(shares > 0)) return `Invalid share count for ${ticker}.`;
-        const positions = await getPositions();
-        const position = positions.find((p: any) => p.symbol === ticker);
-        const qty = position ? parseFloat(position.qty) : 0;
-        if (qty >= 0) return `No short position found for ${ticker}.`;
-        const shortSize = Math.abs(qty);
-        if (shares > shortSize) {
-          return `Cannot cover ${shares} — only ${shortSize} ${ticker} shorted.`;
-        }
-        const order = await placeOrder(ticker, { qty: Math.floor(shares) }, "buy");
-        log(`📈 COVER ${shares} ${ticker} — order ${order.id} (${order.status})`);
-        return `Submitted BUY TO COVER ${shares} ${ticker} @ market. Order ${order.id}, status ${order.status}.`;
       }
 
       case "get_stock_news":
@@ -990,6 +1128,50 @@ const executeTool = async (name: string, args: any): Promise<string> => {
 // Agent loop — a single trading session.
 // ---------------------------------------------------------------------------
 
+/**
+ * Shrink the conversation before resending it.
+ *
+ * Every turn re-sends the entire history, so a news dump fetched on turn 2 is
+ * paid for again on turns 3, 4, 5 and 6. The bulk of that history is stale tool
+ * output the model has already acted on: it needs the prices it just looked up,
+ * not the full text of eight articles it read three turns ago.
+ *
+ * Message SHAPE is preserved exactly — every tool result keeps its
+ * `tool_call_id`, because dropping one would orphan its assistant tool call and
+ * the request would be rejected. Only the body of older tool results is
+ * replaced with a one-line stub.
+ */
+const KEEP_VERBATIM_TOOL_RESULTS = 4;
+
+const pruneHistory = (
+  messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]
+): OpenAI.Chat.Completions.ChatCompletionMessageParam[] => {
+  const toolIndexes = messages
+    .map((message, index) => (message.role === "tool" ? index : -1))
+    .filter((index) => index >= 0);
+
+  if (toolIndexes.length <= KEEP_VERBATIM_TOOL_RESULTS) return messages;
+
+  const staleBefore = toolIndexes[toolIndexes.length - KEEP_VERBATIM_TOOL_RESULTS];
+
+  return messages.map((message, index) => {
+    if (message.role !== "tool" || index >= staleBefore) return message;
+    const body = String(message.content ?? "");
+    if (body.length <= 160) return message;
+    return { ...message, content: `${body.slice(0, 160)}… [older result trimmed]` };
+  });
+};
+
+/** One line of cost accounting, so a quota failure is diagnosable after the fact. */
+const logUsage = (): void => {
+  const total = modelUsage.promptTokens + modelUsage.completionTokens;
+  log(
+    `📊 Model usage: ${modelUsage.requests} request(s), ${modelUsage.promptTokens} prompt + ` +
+      `${modelUsage.completionTokens} completion = ${total} tokens ` +
+      `(budget ${MAX_MODEL_REQUESTS} requests/session).`
+  );
+};
+
 const runTradingSession = async (): Promise<void> => {
   log("🚀 Starting Gemini trading session");
 
@@ -997,7 +1179,7 @@ const runTradingSession = async (): Promise<void> => {
   // not suggestions it can reason its way out of.
   const exitSummary = await runExitSweep();
 
-  const breakerTripped = sessionDrawdownPct >= riskConfig.maxDrawdownPct;
+  const derisked = sessionDrawdownPct >= riskConfig.maxDrawdownPct;
   const riskBriefing =
     `RISK ENGINE REPORT (enforced automatically in code, before this session):\n` +
     `${exitSummary}\n\n` +
@@ -1006,11 +1188,14 @@ const runTradingSession = async (): Promise<void> => {
     `- No single position may exceed ${riskConfig.maxPositionPct}% of equity; oversized buys are reduced automatically\n` +
     `- A ${riskConfig.cashReservePct}% cash reserve is held back and cannot be deployed\n` +
     `- At most ${riskConfig.maxBuysPerSession} buy orders per session\n` +
-    `- Current drawdown from peak equity: ${sessionDrawdownPct.toFixed(2)}% ` +
-    `(new buys are blocked at ${riskConfig.maxDrawdownPct}%)\n` +
-    (breakerTripped
-      ? `\n⚠️ THE DRAWDOWN BREAKER IS ACTIVE. New buys will be rejected this session. ` +
-        `You may still sell, trim, or close positions — focus on reviewing what you hold.\n`
+    `- Stocks under $${riskConfig.minSharePrice}/share cannot be bought at all\n` +
+    `- A ticker you sold cannot be re-bought for ${riskConfig.minRebuyHours}h\n` +
+    `- Partial sells under $${riskConfig.minSellNotional} are rejected; use close_all to exit a position\n` +
+    `- Current drawdown from peak equity (${riskConfig.peakLookbackDays}-day window): ` +
+    `${sessionDrawdownPct.toFixed(2)}% (position sizing halves at ${riskConfig.maxDrawdownPct}%)\n` +
+    (derisked
+      ? `\n⚠️ DE-RISK MODE IS ACTIVE: the per-position cap is halved this session. ` +
+        `Buying is still allowed — recovering requires being invested — but size down and be selective.\n`
       : "") +
     `\nDo not fight these limits or retry a blocked order unchanged — adapt your plan to them.`;
 
@@ -1024,26 +1209,62 @@ const runTradingSession = async (): Promise<void> => {
     { role: "system", content: systemPrompt },
     {
       role: "user",
-      content: `It's ${etTime} (US Eastern). The US stock market is OPEN for trading right now, so real-time quotes and order execution are available.\n\n${riskBriefing}\n\nTime for your trading analysis! Use the think tool first, then review your portfolio and net worth, check prices for tickers you're interested in, and call get_stock_news for any ticker you're considering to factor in recent financial news + sentiment before you trade. Then execute trades to grow the portfolio. Good luck! 📈`,
+      content: `It's ${etTime} (US Eastern). The US stock market is OPEN, so live quotes and order execution are available.\n\n${riskBriefing}\n\nPlan the session with think, review the portfolio, price your shortlist in one batched call, check news on the names you're serious about, and act. Holding is a valid outcome — trade only if you can say what would make you exit. 📈`,
     },
   ];
 
-  const maxTurns = 8;
+  // The model in use for this session. Downgraded in place if the primary's
+  // daily quota runs out mid-session.
+  let activeModel = MODEL;
+
+  const maxTurns = 5;
   for (let turn = 1; turn <= maxTurns; turn++) {
-    const completion = await withRetry(
-      () =>
-        gemini.chat.completions.create({
-          model: MODEL,
-          messages,
+    if (modelUsage.requests >= MAX_MODEL_REQUESTS) {
+      log(
+        `⏹️  Model request budget spent (${modelUsage.requests}/${MAX_MODEL_REQUESTS}); ending session.`
+      );
+      logUsage();
+      return;
+    }
+
+    const complete = (model: string) =>
+      withRetry(async () => {
+        await paceRequest();
+        return gemini.chat.completions.create({
+          model,
+          messages: pruneHistory(messages),
           tools,
           tool_choice: "auto",
-        }),
-      `Gemini completion (turn ${turn})`
-    );
+          // Cast: `reasoning_effort` is a Gemini extension to the OpenAI schema.
+          ...({ reasoning_effort: REASONING_EFFORT } as any),
+        });
+      }, `Gemini completion (turn ${turn}, ${model})`);
+
+    let completion;
+    try {
+      completion = await complete(activeModel);
+    } catch (error) {
+      // A spent daily quota on the primary says nothing about the fallback's
+      // own pool. Try once there before abandoning the session.
+      if (!isDailyQuotaExhausted(error) || activeModel === FALLBACK_MODEL) throw error;
+      log(`↩️  Falling back to ${FALLBACK_MODEL} for the rest of this session.`);
+      activeModel = FALLBACK_MODEL;
+      completion = await complete(activeModel);
+    }
+
+    modelUsage.requests++;
+    modelUsage.promptTokens += completion.usage?.prompt_tokens ?? 0;
+    modelUsage.completionTokens += completion.usage?.completion_tokens ?? 0;
 
     const choice = completion.choices[0];
     const message = choice.message;
     const toolCalls = message.tool_calls || [];
+
+    // The `think` tool used to make reasoning visible in the logs, at the cost
+    // of a whole request per call — a fifth of the session budget to be told
+    // "Recorded 3 reasoning step(s)". Logging the model's own commentary gets
+    // the same visibility for free.
+    if (message.content) log(`🧠 ${message.content}`);
 
     // Re-add the assistant turn (clean shape) so tool results can reference it.
     messages.push({
@@ -1053,8 +1274,8 @@ const runTradingSession = async (): Promise<void> => {
     });
 
     if (toolCalls.length === 0) {
-      if (message.content) log(`🤖 ${message.content}`);
       log(`✅ Session complete after ${turn} turn(s).`);
+      logUsage();
       return;
     }
 
@@ -1078,6 +1299,7 @@ const runTradingSession = async (): Promise<void> => {
   }
 
   log(`⏹️  Reached max turns (${maxTurns}); ending session.`);
+  logUsage();
 };
 
 // ---------------------------------------------------------------------------

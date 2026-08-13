@@ -19,19 +19,51 @@ export interface RiskConfig {
   maxPositionPct: number;
   /** Keep at least this percent of equity in cash, undeployed. */
   cashReservePct: number;
-  /** Block new buys once equity falls this far below its peak. */
+  /** Halve position sizing once equity falls this far below its peak. */
   maxDrawdownPct: number;
   /** Cap buy orders per session to limit spread-cost churn. */
   maxBuysPerSession: number;
+  /**
+   * Refuse to re-buy a ticker sold within this many hours. Kills the
+   * sell-then-buy-back-higher round trip, which pays the spread twice for no
+   * change in exposure.
+   */
+  minRebuyHours: number;
+  /**
+   * Refuse buys below this share price. Sub-$10 names carry percentage spreads
+   * one to two orders of magnitude wider than large caps; on an account this
+   * size the spread, not the thesis, decides the outcome.
+   */
+  minSharePrice: number;
+  /**
+   * Minimum dollar value of a sell. Blocks the "trim $2 off a $20 position"
+   * order, which pays a full spread to change nothing.
+   */
+  minSellNotional: number;
+  /**
+   * How far back the equity high-water mark is measured. A peak must eventually
+   * expire: an unbounded lookback means one good week in August can suppress
+   * position sizing until November, long after it stopped being informative.
+   */
+  peakLookbackDays: number;
 }
 
+// Tuned for a ~$100 account trading a few times a day. The binding constraint
+// at this size is transaction cost, not catastrophic loss: a 25% position cap
+// forces at least four names, which on liquid large caps is an index tracker
+// paying spread on every rebalance. Fewer, larger, longer-held positions is the
+// only shape in which a small account can express an edge at all.
 export const DEFAULT_RISK_CONFIG: RiskConfig = {
-  stopLossPct: 7,
-  takeProfitPct: 15,
-  maxPositionPct: 25,
-  cashReservePct: 10,
-  maxDrawdownPct: 15,
-  maxBuysPerSession: 4,
+  stopLossPct: 8,
+  takeProfitPct: 25,
+  maxPositionPct: 40,
+  cashReservePct: 5,
+  maxDrawdownPct: 20,
+  maxBuysPerSession: 2,
+  minRebuyHours: 24,
+  minSharePrice: 10,
+  minSellNotional: 5,
+  peakLookbackDays: 30,
 };
 
 /**
@@ -58,6 +90,16 @@ export const loadRiskConfig = (
     maxBuysPerSession: read(
       "RISK_MAX_BUYS_PER_SESSION",
       DEFAULT_RISK_CONFIG.maxBuysPerSession
+    ),
+    minRebuyHours: read("RISK_MIN_REBUY_HOURS", DEFAULT_RISK_CONFIG.minRebuyHours),
+    minSharePrice: read("RISK_MIN_SHARE_PRICE", DEFAULT_RISK_CONFIG.minSharePrice),
+    minSellNotional: read(
+      "RISK_MIN_SELL_NOTIONAL",
+      DEFAULT_RISK_CONFIG.minSellNotional
+    ),
+    peakLookbackDays: read(
+      "RISK_PEAK_LOOKBACK_DAYS",
+      DEFAULT_RISK_CONFIG.peakLookbackDays
     ),
   };
 };
@@ -172,6 +214,14 @@ export interface BuyRequest {
   buysThisSession: number;
   /** Current drawdown from peak, in percent. */
   currentDrawdownPct: number;
+  /**
+   * Hours since this ticker was last SOLD, or undefined if it has not been sold
+   * recently. Derived from broker fill history, so nothing has to survive
+   * locally between runs.
+   */
+  hoursSinceLastSell?: number;
+  /** Current share price, when known. Undefined skips the penny-stock check. */
+  sharePrice?: number;
   config: RiskConfig;
 }
 
@@ -192,8 +242,9 @@ export interface BuyVerdict {
  * amount lets the agent still act, whereas a hard denial burns one of its few
  * turns. Denial is reserved for cases where no trade at all is acceptable.
  *
- * Sells are deliberately never vetted. Blocking an exit could trap the agent
- * in a losing position, which is far more dangerous than any oversized buy.
+ * Sells are vetted only for triviality (see `vetSell`) — never for direction.
+ * Blocking a real exit could trap the agent in a losing position, which is far
+ * more dangerous than any oversized buy.
  */
 export const vetBuy = (request: BuyRequest): BuyVerdict => {
   const { config } = request;
@@ -209,17 +260,41 @@ export const vetBuy = (request: BuyRequest): BuyVerdict => {
     return deny("Requested amount must be a positive dollar figure.");
   }
 
-  // 1. Circuit breaker — the account is in trouble; stop adding risk.
-  if (request.currentDrawdownPct >= config.maxDrawdownPct) {
+  // 1. Penny-stock filter — below this price the bid/ask spread, not the
+  //    thesis, determines the outcome of a round trip.
+  if (
+    request.sharePrice !== undefined &&
+    Number.isFinite(request.sharePrice) &&
+    request.sharePrice < config.minSharePrice
+  ) {
     return deny(
-      `RISK HALT: equity is ${request.currentDrawdownPct.toFixed(
-        1
-      )}% below its peak, at or beyond the ${config.maxDrawdownPct}% max-drawdown limit. ` +
-        `New buys are blocked for this session. You may still sell or close positions.`
+      `RISK BLOCK: ${request.ticker} trades at $${request.sharePrice.toFixed(
+        2
+      )}, below the $${config.minSharePrice} minimum share price. Sub-$${
+        config.minSharePrice
+      } names carry spreads wide enough to consume any edge on an account this ` +
+        `size. Pick a liquid large-cap instead — fractional orders make share price irrelevant to affordability.`
     );
   }
 
-  // 2. Turnover cap — every round trip pays the spread.
+  // 2. Re-buy cooldown — selling a name and buying it back the same day pays
+  //    the spread twice and leaves exposure unchanged.
+  if (
+    request.hoursSinceLastSell !== undefined &&
+    Number.isFinite(request.hoursSinceLastSell) &&
+    request.hoursSinceLastSell < config.minRebuyHours
+  ) {
+    return deny(
+      `RISK BLOCK: you sold ${request.ticker} ${request.hoursSinceLastSell.toFixed(
+        1
+      )}h ago and cannot re-buy it for another ${(
+        config.minRebuyHours - request.hoursSinceLastSell
+      ).toFixed(1)}h. Reversing a decision within a day is churn, not a trade — ` +
+        `it pays the spread twice for no change in exposure. Deploy into a different name or hold.`
+    );
+  }
+
+  // 3. Turnover cap — every round trip pays the spread.
   if (request.buysThisSession >= config.maxBuysPerSession) {
     return deny(
       `RISK LIMIT: ${request.buysThisSession} buy order(s) already placed this session ` +
@@ -228,7 +303,7 @@ export const vetBuy = (request: BuyRequest): BuyVerdict => {
     );
   }
 
-  // 3. Cash reserve — never deploy the last dollar.
+  // 4. Cash reserve — never deploy the last dollar.
   const reserve = request.equity * (config.cashReservePct / 100);
   const deployableCash = request.cash - reserve;
   if (deployableCash < MIN_NOTIONAL) {
@@ -240,15 +315,29 @@ export const vetBuy = (request: BuyRequest): BuyVerdict => {
     );
   }
 
-  // 4. Concentration cap — no single name may dominate the book.
-  const positionCap = request.equity * (config.maxPositionPct / 100);
+  // 5. Drawdown response — DE-RISK, never halt.
+  //
+  //    A hard buy-block during drawdown is an absorbing state: recovering
+  //    requires being invested, so blocking every buy while stop-losses keep
+  //    firing guarantees the account ratchets down and never climbs back to the
+  //    peak that triggered the block. Halving position size cuts risk while
+  //    leaving a path back up.
+  const derisked = request.currentDrawdownPct >= config.maxDrawdownPct;
+  const effectiveMaxPositionPct = derisked
+    ? config.maxPositionPct / 2
+    : config.maxPositionPct;
+
+  // 6. Concentration cap — no single name may dominate the book.
+  const positionCap = request.equity * (effectiveMaxPositionPct / 100);
   const headroom = positionCap - request.existingPositionValue;
   if (headroom < MIN_NOTIONAL) {
     return deny(
       `RISK LIMIT: ${request.ticker} already holds $${request.existingPositionValue.toFixed(
         2
-      )}, at or above the ${config.maxPositionPct}% per-position cap ` +
-        `($${positionCap.toFixed(2)}). Buy something else or trim this position first.`
+      )}, at or above the ${effectiveMaxPositionPct}% per-position cap ` +
+        `($${positionCap.toFixed(2)})${
+          derisked ? " (halved because the account is in drawdown)" : ""
+        }. Buy something else or trim this position first.`
     );
   }
 
@@ -277,7 +366,9 @@ export const vetBuy = (request: BuyRequest): BuyVerdict => {
   const binding =
     deployableCash <= headroom
       ? `the ${config.cashReservePct}% cash reserve`
-      : `the ${config.maxPositionPct}% per-position cap`;
+      : `the ${effectiveMaxPositionPct}% per-position cap${
+          derisked ? " (halved because the account is in drawdown)" : ""
+        }`;
 
   return {
     allowed: true,
@@ -287,4 +378,95 @@ export const vetBuy = (request: BuyRequest): BuyVerdict => {
       `RISK ADJUSTED: reduced from $${request.requestedNotional.toFixed(2)} to ` +
       `$${approvedNotional.toFixed(2)} for ${request.ticker}, limited by ${binding}.`,
   };
+};
+
+// ---------------------------------------------------------------------------
+// Sell vetting
+// ---------------------------------------------------------------------------
+
+export interface SellRequest {
+  ticker: string;
+  /** Dollar value of the proposed sale. */
+  notional: number;
+  /** Dollar value of the whole position, used to recognise a full exit. */
+  positionValue: number;
+  config: RiskConfig;
+}
+
+export interface SellVerdict {
+  allowed: boolean;
+  reason: string;
+}
+
+/**
+ * Reject only trivially small sells.
+ *
+ * A trim worth a couple of dollars pays a full bid/ask spread to change
+ * essentially nothing about the book — it is a rounding error with a
+ * transaction cost attached. This is the mirror of `MIN_NOTIONAL` on the buy
+ * side, which the sell path previously lacked entirely.
+ *
+ * A full exit is ALWAYS permitted regardless of size: closing a $2 leftover is
+ * legitimate housekeeping, and never blocking an exit is the whole point.
+ */
+export const vetSell = (request: SellRequest): SellVerdict => {
+  const { config } = request;
+
+  if (!Number.isFinite(request.notional) || request.notional <= 0) {
+    return { allowed: false, reason: "Sell amount must be a positive dollar figure." };
+  }
+
+  // Treat "within a cent of the whole position" as a full exit — fractional
+  // share counts do not round-trip cleanly through JSON.
+  const isFullExit = request.notional >= request.positionValue - 0.01;
+  if (isFullExit) {
+    return { allowed: true, reason: "Full exit — always permitted." };
+  }
+
+  if (request.notional < config.minSellNotional) {
+    return {
+      allowed: false,
+      reason:
+        `RISK BLOCK: a $${request.notional.toFixed(2)} sell of ${request.ticker} is below the ` +
+        `$${config.minSellNotional} minimum. A trim this small pays a full bid/ask spread to ` +
+        `change nothing — the position is worth $${request.positionValue.toFixed(2)}. ` +
+        `Either exit the position properly or leave it alone.`,
+    };
+  }
+
+  return { allowed: true, reason: "Within risk limits." };
+};
+
+// ---------------------------------------------------------------------------
+// Re-buy cooldown
+// ---------------------------------------------------------------------------
+
+/** A filled order, reduced to what the cooldown rule needs. */
+export interface FillRecord {
+  ticker: string;
+  side: "buy" | "sell";
+  /** ISO timestamp of the fill. */
+  date: string;
+}
+
+/**
+ * Hours since `ticker` was last sold, or undefined if it was never sold in the
+ * supplied history. Derived from broker fills so the rule survives the agent
+ * being stateless between runs.
+ */
+export const hoursSinceLastSell = (
+  ticker: string,
+  fills: FillRecord[],
+  now: Date = new Date()
+): number | undefined => {
+  let latest: number | undefined;
+  for (const fill of fills) {
+    if (fill.side !== "sell") continue;
+    if (fill.ticker.toUpperCase() !== ticker.toUpperCase()) continue;
+    const at = new Date(fill.date).getTime();
+    if (!Number.isFinite(at)) continue;
+    if (latest === undefined || at > latest) latest = at;
+  }
+  if (latest === undefined) return undefined;
+  return Math.max(0, (now.getTime() - latest) / 3_600_000);
 };
