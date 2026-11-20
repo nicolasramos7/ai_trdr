@@ -1,354 +1,177 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code (claude.ai/code) when working in this repository.
 
-## Project Overview
+> This file was substantially out of date before the risk-engine-v2 change: it
+> described OpenAI GPT-5 models, Docker Compose deployment, `thread.json`
+> conversation persistence, a `think` tool, and a dozen npm scripts that do not
+> exist. None of that was true. Treat anything here as authoritative only if it
+> matches the code.
 
-This is an autonomous AI-powered stock trading agent built with OpenAI's Agents framework. The agent executes trades automatically using Alpaca's paper trading API, starting with $100,000 virtual capital and attempting to grow the portfolio through strategic trading decisions.
+## Project overview
 
-## Key Commands
+An autonomous AI trading agent that paper-trades a **~$100** Alpaca account. It
+runs on GitHub Actions, uses Google Gemini via the OpenAI-compatible endpoint,
+and is split into two halves:
 
-### Development
-- `npm start` - Run the trading agent locally (executes one trading session)
-- `npm run start:continuous` - Run the agent continuously (every 30 minutes by default)
-- `npm run start:continuous:1h` - Run continuously every hour
-- `npm run start:continuous:4h` - Run continuously every 4 hours
-- `npm install` - Install dependencies
-- `tsx src/agent.ts` - Direct execution of the agent (single session)
-- `tsx src/agent.ts --continuous --interval=2` - Run continuously every 2 hours
+- **The agent** (`src/agent.ts`) — up to 3 sessions per trading day. Decides
+  what to own. Needs Gemini.
+- **The exit sweep** (`worker/src/index.ts`) — a Cloudflare Worker running every
+  two minutes during market hours. Decides what to get out of. No model, no
+  Gemini, no judgement.
 
-### 🚨 Important: Running with Profile Environment Files
-**RECOMMENDED APPROACH:** Use `npx dotenv -e .env.profilename` to load all API keys:
-```bash
-# Correct way - loads all API keys from .env.gpt5mini (RECOMMENDED)
-npx dotenv -e .env.gpt5mini -- npm run start:continuous
+Both import the same `src/risk.ts`.
 
-# Alternative - GPT-5 premium model (may hit rate limits)
-npx dotenv -e .env.gpt5 -- npm run start:continuous
-```
-The dotenv approach is required because API keys are stored in the profile-specific .env files.
-
-### Testing
-- `npm test` - Run all tests with Jest framework
-- `npm run test:watch` - Watch mode for development
-- `npm run test:coverage` - Generate coverage reports
-- See **Testing Framework** section below for comprehensive details
-
-### Supported AI Models
-**GPT-5 Mini** (OpenAI's latest efficient model, August 2025) - **RECOMMENDED**
-- Excellent performance for trading decisions
-- Superior rate limits (no 429 errors)
-- Cost-effective with fast execution
-- Configured in `.env.gpt5mini`
-
-**GPT-5** (OpenAI's flagship model)
-- Best reasoning and market analysis
-- Limited rate limits (30k tokens/min)
-- Higher costs but premium performance
-- Configured in `.env.gpt5`
-
-**How to Run Trading Agents:**
-```bash
-# GPT-5 Mini (RECOMMENDED - Best rate limits)
-# Single session
-npx dotenv -e .env.gpt5mini -- npm start
-
-# Continuous trading (every 30 minutes during market hours)
-npx dotenv -e .env.gpt5mini -- npm run start:continuous
-
-# Continuous with different intervals
-npx dotenv -e .env.gpt5mini -- npm run start:continuous:1h    # Every hour
-npx dotenv -e .env.gpt5mini -- npm run start:continuous:4h    # Every 4 hours
-
-# GPT-5 (Premium option - may hit rate limits)
-# Single session
-npx dotenv -e .env.gpt5 -- npm start
-
-# Continuous trading (every 30 minutes during market hours)
-npx dotenv -e .env.gpt5 -- npm run start:continuous
-```
-
-**Note:** 
-- GPT-5 Mini is recommended for production use due to better rate limits and cost efficiency
-- Always use `npx dotenv -e .env.profilename` to ensure all API keys are loaded from the profile files
-
-### Profile-Based Trading Setup
-Run the trading agent with profile-based configuration for organized data management:
-
-**Available Profiles:**
-- **GPT-5 Mini Profile** (`.env.gpt5mini`) - Recommended for production trading
-- **GPT-5 Profile** (`.env.gpt5`) - Premium model with rate limits
-
-**Setup Steps:**
-1. **Create Alpaca Paper Trading Account:**
-   - Go to [Alpaca Markets](https://app.alpaca.markets/paper/dashboard/overview)
-   - Create a paper trading account
-   - Account starts with $100,000 virtual capital
-   - Note the API keys for the account
-
-2. **Configure Profile Environment File:**
-   - **GPT-5 Mini**: Configure `.env.gpt5mini` with Alpaca account + OpenAI API key (RECOMMENDED)
-   - **GPT-5**: Configure `.env.gpt5` with Alpaca account + OpenAI API key
-   - Each profile gets isolated data files and trading account
-
-**Running with Profile:**
-```bash
-# GPT-5 Mini trader (RECOMMENDED)
-npx dotenv -e .env.gpt5mini -- npm run start:continuous
-
-# GPT-5 trader (premium option)
-npx dotenv -e .env.gpt5 -- npm run start:continuous
-
-# Different time intervals
-npx dotenv -e .env.gpt5mini -- npm run start:continuous:1h    # Every hour
-npx dotenv -e .env.gpt5mini -- npm run start:continuous:4h    # Every 4 hours
-```
-
-**Profile Isolation & Performance Tracking:**
-- **Separate Data Files:** Profile gets its own `thread-{profile}.json`, `README-{profile}.md`, `agent-{profile}.log`
-- **Individual Dashboards:** `README-gpt5mini.md`, `README-gpt5.md`
-- **Separate CSV Reports:** `pnl_gpt-5-mini_{date}.csv`, `pnl_gpt-5_{date}.csv`
-- **Dedicated Alpaca Account:** Complete account isolation ($100k)
-
-**Prerequisites:**
-Install dotenv-cli if not already installed:
-```bash
-npm install -g dotenv-cli
-```
-
-### Testing Framework
-The project includes a comprehensive Jest-based testing suite with mock APIs for safe testing:
-
-#### Test Commands
-- `npm test` - Run all tests
-- `npm run test:watch` - Run tests in watch mode (auto-restart on changes)
-- `npm run test:coverage` - Run tests with coverage report
-- `npm run test:ci` - Run tests for CI environment (no watch mode)
-- `npm run test:agents` - Test agent functionality end-to-end
-- `npm run test:agents:verbose` - Run agent tests with detailed output
-- `npm run test:trading` - Test trading service functions only
-- `npm run test:all` - Run all tests sequentially
-
-#### Test Types
-1. **Agent Integration Tests** (`agents.test.ts`):
-   - Real agent execution with 45-second timeout
-   - Tool availability validation (think, buy, sell, short_sell, etc.)
-   - API integration verification
-   - Configuration and environment testing
-
-2. **Trading Service Tests** (`trading.test.ts`):
-   - Stock price fetching (Alpaca → Yahoo Finance → fallback)
-   - Portfolio management (account, positions, orders)
-   - Buy/sell operations with validation
-   - Net worth calculations and CAGR
-   - Web search functionality
-
-3. **Unit Tests** (`trading-simple.test.ts`):
-   - Core mathematical functions (CAGR calculations)
-   - Schema validation for portfolio data
-   - Utility function testing
-
-#### Mock Framework
-- **Safe Testing**: All tests use mock APIs - no real trading
-- **Comprehensive Mocks**: Alpaca API, Yahoo Finance, OpenAI simulation
-- **Realistic Data**: Proper market data for thorough testing
-- **Error Simulation**: Tests failure scenarios and recovery mechanisms
-
-#### Test Coverage
-- API failures and fallback mechanisms
-- Edge cases (insufficient funds, missing positions)
-- Data validation and type checking
-- Real agent execution in controlled environment
+The goal is **risk-adjusted** return: beating buy-and-hold SPY after accounting
+for drawdowns, not maximising raw profit.
 
 ## Architecture
 
-### Core Components
-
-**agent.ts** - Main application file containing:
-- Trading agent logic using OpenAI's Agents framework
-- Alpaca API integration for real paper trading
-- Stock price fetching via Alpaca market data API with Yahoo Finance fallback
-- Trading tools (buy, sell, get_portfolio, get_net_worth, get_stock_price, get_stock_news, think)
-- Thread persistence for conversation history
-- README auto-update functionality
-
-**Data Files:**
-- `thread.json` - Agent conversation history for continuity
-- `agent.log` - Trading activity logs
-- `system-prompt.md` - Agent instructions and trading strategy
-- `.env` - Environment variables (OpenAI API key, Alpaca credentials)
-- `pnl_[MODEL]_[DATE].csv` - P&L reports generated per model per day
-
-### Key Functions
-
-- `getStockPrice()` - Fetches current stock prices using Alpaca market data API with Yahoo Finance fallback
-- `calculateNetWorth()` - Gets total portfolio value from Alpaca account
-- `calculateCAGR()` - Calculates annualized returns
-- `updateReadme()` - Auto-updates README with current portfolio stats
-- `generateCSVReport()` - Creates P&L CSV report per model per day
-- `loadThread()`/`saveThread()` - Manages conversation persistence
-- `getAlpacaAccount()` - Gets Alpaca paper trading account information
-- `getAlpacaPositions()` - Gets current stock positions from Alpaca
-- `getAlpacaOrderHistory()` - Gets trading history from Alpaca
-
-### Agent Tools
-
-The trading agent has access to these tools:
-- `think` - Step-by-step reasoning (required before other tools)
-- `get_portfolio` - View current holdings and trade history from Alpaca
-- `get_net_worth` - Check total portfolio value from Alpaca account
-- `get_stock_price` - Get current price for any ticker via Alpaca/Yahoo Finance
-- `buy`/`sell` - Execute real trades via Alpaca paper trading API
-- `get_stock_news` - Get real-time financial news + headline sentiment for a ticker via Finnhub (set `FINNHUB_API_KEY`; free key at https://finnhub.io, no credit card)
-
-### Portfolio Schema
-
-Portfolio data is now sourced from Alpaca paper trading account:
-```typescript
-{
-  cash: number, // From Alpaca account.cash
-  holdings: Record<string, number>, // From Alpaca positions
-  history: Array<{ // From Alpaca order history
-    date: string,
-    type: "buy" | "sell",
-    ticker: string,
-    shares: number,
-    price: number,
-    total: number
-  }>
-}
+```
+src/risk.ts          Pure risk engine. ZERO imports — see the portability
+                     contract at the top of the file. Runs in Node AND in the
+                     Cloudflare Worker.
+src/agent.ts         Gemini session: tools, prompting, order placement, pacing.
+worker/src/index.ts  Two-minute exit sweep. Only ever SELLS.
+scripts/             Operational scripts (see below).
+tests/               117 tests, all against src/risk.ts.
 ```
 
-## Reporting Features
+### `src/risk.ts` — the portability contract
 
-### CSV P&L Reports
-- **Automatic Generation**: CSV reports are generated after each trading session
-- **Per-Model Tracking**: Each AI model generates separate CSV files for performance comparison
-- **File Format**: `pnl_[MODEL]_[DATE].csv` (e.g., `pnl_gpt-4o-mini_2025-07-31.csv`)
-- **Contents**: Date, Type, Ticker, Shares, Price, Total, Model, P&L, P&L_Percent, Cache_Enabled, Cache_TTL
-- **Use Cases**: Compare model performance, track trading strategies, analyze P&L patterns
+**This file must never gain an import, and must never touch `process`, the
+filesystem or the network.** Config arrives as an injected object. Breaking this
+breaks the Worker build, and the point of the constraint is that there is
+exactly one implementation of the exit rules rather than two that drift.
 
-### README Auto-Update
-- **Live Portfolio**: README.md shows current portfolio value and holdings
-- **Recent Trades**: Last 10 trades with P&L calculations
-- **Performance Metrics**: CAGR and total returns from initial investment
-- **Auto-Refresh**: Updates after every successful trading session
+Key exports: `loadRiskConfig`, `atrPercent`, `highWaterSince`,
+`stopDistancePct`, `trailDistancePct`, `sizePosition`, `detectRegime`,
+`vetSpread`, `decideExits`, `vetBuy`, `vetSell`, `hoursSinceEntry`,
+`hoursSinceLastSell`, `drawdownPct`, `peakEquity`.
 
-## AI Model Caching
+### How risk actually works
 
-The trading agent implements advanced caching to reduce costs and improve response times:
+- **Sizing is volatility-targeted**, not a flat percentage: `notional = equity *
+  riskPerTradePct / stopPct`, capped at `maxPositionPct`. A name needing a wide
+  stop gets a small position, so every position carries the same dollar risk.
+- **Stops scale to the instrument** (`atrStopMultiple` × ATR, clamped into
+  `[minStopPct, maxStopPct]`), falling back to the flat `stopLossPct` when no
+  bar data is available.
+- **The trailing stop needs no stored state.** Its high-water mark is
+  reconstructed from bars on every call (`highWaterSince`), which is what makes
+  it possible for a stateless process holding fractional shares. Alpaca's native
+  trailing-stop *order* type is unavailable on fractional positions.
+- **The regime filter** (`detectRegime`) scales gross exposure from the
+  benchmark's trend. It fails to `neutral`, never to `risk_off`, so a data
+  outage cannot silently halt the strategy.
+- **The model cannot override any of this.** It proposes; the engine disposes.
 
-### OpenAI Automatic Caching
-- **Automatic Activation**: Enabled by default for all OpenAI models (GPT-5, GPT-5-mini, GPT-5-nano, GPT-4o, GPT-4o-mini, o1-preview, o1-mini)
-- **Cost Savings**: 50% discount on cached tokens (prompts >1,024 tokens)
-- **Performance**: Faster response times for repeated system prompts
-- **GPT-5 Enhanced**: GPT-5 models benefit from improved caching efficiency
-- **Monitoring**: Cache hit information logged in trading sessions
-- **No Configuration**: Works automatically, no setup required
+## Commands
 
-### Benefits for Trading
-- **Lower Costs**: 50% savings on system prompt processing
-- **Faster Decisions**: Reduced latency for time-sensitive trades
-- **Consistent Strategy**: Same cached system prompt ensures uniform trading rules
-- **Better ROI**: Cost savings mean more budget available for actual trading
-
-### Monitoring
-- Cache statistics logged after each trading session
-- CSV reports include cache configuration information
-- Hit rates and cost savings displayed in logs
-
-## Docker Deployment
-
-### Building and Running with Docker
-
-The trading agent can be containerized for deployment on any machine with Docker:
-
-#### Prerequisites
-- Docker and Docker Compose installed
-- Environment files configured (`.env.gpt5mini`, `.env.gpt5`)
-
-#### Quick Start
 ```bash
-# Build and run GPT-5 Mini agent (recommended)
-docker-compose --profile gpt5mini up --build
-
+npm start                  # one trading session, then exit
+npm test                   # 117 tests (risk engine)
+npm run build              # tsc --noEmit
+npm run fetch-bars         # cache historical bars for the backtest
+npm run backtest           # before/after metrics across three windows
+npm run backtest:sweep     # parameter sweep on the tuning window
+npm run export-history     # export the live account to CSV (read-only)
+npm run worker:deploy      # deploy the exit sweep
+npm run worker:tail        # stream Worker logs
 ```
 
-#### Environment Setup
-Create your environment files before running:
+Run with a profile env file when credentials live outside `.env`:
+
 ```bash
-# .env.gpt5mini (recommended)
-OPENAI_API_KEY=your_openai_api_key
-ALPACA_API_KEY=your_alpaca_api_key
-ALPACA_SECRET_KEY=your_alpaca_secret_key
-ALPACA_BASE_URL=https://paper-api.alpaca.markets
-
-# .env.gpt5 (premium option)
-OPENAI_API_KEY=your_openai_api_key
-ALPACA_API_KEY=your_alpaca_api_key
-ALPACA_SECRET_KEY=your_alpaca_secret_key
-ALPACA_BASE_URL=https://paper-api.alpaca.markets
+npx dotenv -e .env.gemini -- npm start
 ```
 
-#### Data Persistence
-- Trading data persists in `./results` directory
-- Logs persist in `./logs` directory
-- Container automatically restarts unless manually stopped
+### Safe testing
 
-#### Docker Commands
-```bash
-# Build image
-docker build -t priced-in .
+`DRY_RUN=true` runs a complete session — risk engine, Gemini, decisions — and
+submits **no orders**. It is also the only way to run outside market hours.
 
-# Run continuous trading
-docker run -d --env-file .env.gpt5mini -v $(pwd)/results:/app/results --name trading-bot priced-in
+Do **not** reintroduce a flag like the old `TESTING_MODE`, which worked by making
+`isMarketOpen()` return `true` unconditionally. That disabled the only gate
+between the agent and a closed market, and eight orders in the account's history
+were submitted outside 09:30–16:00 ET as a result.
 
-# Run single session
-docker run --env-file .env.gpt5mini -v $(pwd)/results:/app/results priced-in npm start
+## Things that are load-bearing and easy to break
 
-# View logs
-docker logs -f trading-bot
+1. **The market-hours gate asks the broker** (`/v2/clock`), not the local clock.
+   A hand-rolled weekday-and-time check knows nothing about federal holidays
+   (three sessions ran on Labor Day 2026) or half-days. It **fails closed**: an
+   unreachable clock means no trading.
 
-# Stop container
-docker stop trading-bot
-```
+2. **Every order carries a `client_order_id`.** Alpaca rejects duplicates, which
+   makes it an idempotency key. Without one, `withRetry` on the order path can
+   double-submit when a 5xx hides a successful submission — the history contains
+   two identical AMC sells four seconds apart, both filled.
 
-## Important Notes
+3. **Model requests are counted per ATTEMPT, not per success.** Retries consume
+   real quota. Counting only successes meant a session could log "3/5 requests"
+   having actually spent seven.
 
-- The agent requires `OPENAI_API_KEY` environment variable
-- The agent requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` for paper trading
-- All trades are executed on Alpaca's paper trading platform (no real money)
-- Stock prices fetched via Alpaca market data API with Yahoo Finance fallback
-- Agent runs automatically every 30 minutes during market hours
-- Paper trading account starts with $100,000 virtual cash
-- README is auto-updated after each trading session with current portfolio value
-- CSV P&L reports are generated per model for performance tracking
-- Agent must use `think` tool before making any decisions (mandatory thinking process)
-- Thread history is persisted across runs for conversation continuity
-- Orders are submitted as market orders and filled according to Alpaca's simulation engine
+4. **The model is verified at startup.** Google retires Gemini ids on a schedule
+   and reroutes some silently (`gemini-2.5-flash` → `gemini-3.5-flash-lite` from
+   2026-12-01). The agent lists available models and refuses to start if the
+   configured one is missing.
 
-## Error Prevention & Recovery
+5. **Order history is paginated.** It was a single `limit: 100` call against an
+   account that had 97 orders. The re-buy cooldown and holding-period rules are
+   derived from that history and would have begun failing open.
 
-The system includes several safeguards to prevent the "function_call without reasoning" error that can occur with GPT-5+ models:
+6. **The keepalive workflow must COMMIT, not merely run.** GitHub disables
+   scheduled workflows on public repos after 60 days of no repository activity.
+   This account's agent was running four jobs a day right up to the moment it
+   was disabled — workflow runs do not count as activity. That outage cost five
+   weeks of no risk management and ~11% of the account.
 
-### 1. **Startup Health Check**
-- Automatically validates thread integrity on startup
-- Detects function calls missing corresponding reasoning items
-- Auto-cleans corrupted threads before they cause issues
+7. **Gemini free-tier limits are not published any more.** Do not hard-code a
+   figure; `MAX_MODEL_REQUESTS` is a repo variable to be set from
+   https://aistudio.google.com/rate-limit. Quotas apply per *project*, not per
+   key, and the `FALLBACK_MODEL` path is best-effort only — the docs do not
+   promise per-model quota pools.
 
-### 2. **Thread Corruption Detection**
-- Proactive scanning for reasoning/function call mismatches during thread loading
-- Automatic backup and cleanup of corrupted thread files
-- Prevention of thread size growth beyond manageable limits
+## Backtesting
 
-### 3. **Runtime Error Recovery**
-- Automatic detection of OpenAI reasoning errors during execution
-- One-time retry with clean thread when errors occur
-- Graceful fallback to ensure trading sessions continue
+`npm run backtest` compares the old and new risk layers over three windows
+(tuning, out-of-sample, full) against buy-and-hold SPY, with a cost model
+calibrated to this account's measured fees.
 
-### 4. **Thread Management**
-- Thread history is automatically trimmed to prevent unbounded growth
-- Corrupted threads are backed up with timestamps for debugging
-- Clean thread initialization when validation fails
+Read it with two caveats firmly in mind:
 
-These safeguards ensure the trading agent remains operational even when OpenAI's API requirements change or thread corruption occurs.
+- **It tests the risk layer, not the stock picking.** Both engines get the same
+  momentum-rank entry signal standing in for the model, so differences are
+  attributable to risk rules alone. There is no way to replay what Gemini would
+  have chosen.
+- **The universe is 20 megacaps chosen in 2026**, so absolute returns are
+  inflated by selection bias. Only the *relative* comparison is meaningful.
+
+The `--sweep` output exists to check the parameters are not pathological, **not**
+to pick them. The surface is noisy enough that adjacent values swing Sortino by
+0.7, so the shipped defaults deliberately sit in the middle of a stable region
+rather than at the in-sample maximum.
+
+## Data files
+
+- `results/{profile}/agent-{profile}.log` — session logs (gitignored)
+- `alpaca-export/*.csv` — account export from `npm run export-history`
+  (gitignored)
+- `backtest-data/*.json` — cached bars (gitignored)
+
+There is **no** `thread.json` and no conversation persistence. Each session is
+stateless by design; everything that needs to survive is derived from Alpaca.
+
+## Required configuration
+
+Secrets: `GEMINI_API_KEY`, `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`,
+`FINNHUB_API_KEY`, optionally `ALPACA_BASE_URL`.
+
+Repo variables: `MODEL`, `FALLBACK_MODEL`, `MAX_MODEL_REQUESTS`.
+
+Cloudflare Worker secrets: `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, optionally
+`SWEEP_TOKEN` and any `RISK_*` override.
+
+See `.env.example`, which documents every risk parameter with its real shipped
+default.

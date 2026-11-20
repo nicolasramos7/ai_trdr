@@ -14,15 +14,25 @@ import invariant from "tiny-invariant";
 import Alpaca from "@alpacahq/alpaca-trade-api";
 import {
   MIN_NOTIONAL,
+  atrPercent,
   decideExits,
   describeExit,
+  detectRegime,
   drawdownPct,
+  highWaterSince,
+  hoursSinceEntry,
   hoursSinceLastSell,
   loadRiskConfig,
   peakEquity,
+  sizePosition,
+  stopDistancePct,
   vetBuy,
   vetSell,
+  vetSpread,
+  type Bar,
   type FillRecord,
+  type RegimeVerdict,
+  type RiskPosition,
 } from "./risk.js";
 
 // ---------------------------------------------------------------------------
@@ -40,6 +50,20 @@ const GEMINI_BASE_URL =
   process.env.GEMINI_BASE_URL ||
   "https://generativelanguage.googleapis.com/v1beta/openai/";
 const PROFILE = process.env.PROFILE_NAME || "gemini";
+
+/**
+ * Dry run: everything executes except order submission.
+ *
+ * This is the replacement for the old `TESTING_MODE`, which worked by making
+ * `isMarketOpen()` return true unconditionally — i.e. the test flag disabled
+ * the production safety gate, and anything that set it could place real
+ * (paper) orders at 22:00 on a Sunday. A dry run instead keeps every gate and
+ * neuters only the one irreversible step.
+ */
+const DRY_RUN = process.env.DRY_RUN === "true";
+if (DRY_RUN) {
+  console.log("🧪 DRY_RUN=true — no orders will be submitted to Alpaca.");
+}
 
 // All credentials come from the environment — nothing is hardcoded.
 invariant(process.env.GEMINI_API_KEY, "GEMINI_API_KEY is not set");
@@ -109,6 +133,23 @@ let buysThisSession = 0;
 let sessionDrawdownPct = 0;
 
 /**
+ * Regime for this session, set once before the model runs.
+ *
+ * Starts permissive so that a code path which somehow skips regime detection
+ * behaves exactly as the engine did before the filter existed, rather than
+ * silently refusing to trade.
+ */
+let sessionRegime: RegimeVerdict = {
+  regime: "neutral",
+  riskMultiplier: 1,
+  maxPositions: riskConfig.maxPositions,
+  reason: "Regime not yet evaluated.",
+};
+
+/** Symbols bought this session, so one session cannot double into a name. */
+const boughtThisSession = new Set<string>();
+
+/**
  * Model-usage accounting.
  *
  * Nothing used to record what a session cost, which made "the agent ran out of
@@ -133,16 +174,25 @@ const REASONING_EFFORT = process.env.GEMINI_REASONING_EFFORT || "low";
 /**
  * Hard ceiling on model requests per session, independent of the turn limit.
  *
- * Sized against the Gemini FREE tier, which is far tighter than it looks:
- * 2.5 Flash allows ~5 requests per MINUTE and only a few dozen per DAY. Four
- * sessions must therefore share a daily budget of roughly 25 requests, so a
- * session gets 5 — with the rest held back as headroom, because a session that
- * overruns does not fail alone: it steals the quota belonging to the 15:00 ET
- * session, the one that positions the book before an 18-hour overnight gap.
+ * Sized against the Gemini FREE tier, whose limits Google NO LONGER PUBLISHES
+ * per model — the former rate-limit table is gone, and the only authoritative
+ * figures are the ones in your own AI Studio dashboard
+ * (https://aistudio.google.com/rate-limit). Community reports for 2.5 Flash
+ * range from 250 requests/day down to 20, a 12x spread, so this is deliberately
+ * sized against the PESSIMISTIC end rather than a guess at the real number.
  *
- * Raise this only alongside a paid tier.
+ * At 3 requests and three scheduled slots a day the worst case is 9
+ * requests/day, which survives even a 20/day cap with room for retries. Note
+ * that retries now count
+ * (see `countedCompletion`) — previously they did not, so the real consumption
+ * was higher than the budget suggested, which is exactly how a session ran out
+ * of quota while believing it had spent 5 of 5.
+ *
+ * Set MAX_MODEL_REQUESTS from your dashboard's actual figure. Quotas apply per
+ * PROJECT, not per key, so other apps on the same Google Cloud project share
+ * this budget.
  */
-const MAX_MODEL_REQUESTS = Number(process.env.MAX_MODEL_REQUESTS) || 5;
+const MAX_MODEL_REQUESTS = Number(process.env.MAX_MODEL_REQUESTS) || 3;
 
 /**
  * Minimum spacing between model requests, to stay under the per-minute limit.
@@ -159,11 +209,65 @@ const MIN_REQUEST_INTERVAL_MS =
 /**
  * Model to fall back to when the primary's daily quota is gone.
  *
- * Each model carries its OWN quota pool, so a Flash exhaustion does not imply a
- * Flash-Lite exhaustion. A cheaper model still reading the news beats the last
- * session of the day not running at all.
+ * BEST EFFORT ONLY. The previous comment here asserted that "each model
+ * carries its OWN quota pool"; Google's current documentation says rate limits
+ * are applied per PROJECT and does not promise per-model pools, so this may
+ * simply fail too. It costs one request to find out and a cheaper model still
+ * reading the news beats the last session of the day not running at all, so the
+ * attempt is kept — but it is not a guarantee, and nothing should be designed
+ * on the assumption that it works.
  */
 const FALLBACK_MODEL = process.env.FALLBACK_MODEL || "gemini-2.5-flash-lite";
+
+/**
+ * Verify the configured model actually exists before trading on it.
+ *
+ * Google is retiring `gemini-2.5-flash` and `gemini-2.5-flash-lite`: from
+ * 2026-12-01 requests to `gemini-2.5-flash` are routed to a different model
+ * (`gemini-3.5-flash-lite`) with different behaviour and different quota.
+ * Without this check the agent would silently keep trading on a model nobody
+ * chose, and the logs would show nothing unusual.
+ *
+ * Returns the list of available model ids, or undefined if the listing itself
+ * is unavailable (in which case we proceed rather than block — an outage on a
+ * metadata endpoint is not a reason to skip a trading session).
+ */
+const verifyModelAvailable = async (): Promise<void> => {
+  let available: string[];
+  try {
+    const listed = await gemini.models.list();
+    available = (listed?.data ?? [])
+      .map((model: any) => String(model.id).replace(/^models\//, ""))
+      .filter(Boolean);
+    if (available.length === 0) {
+      log("⚠️ Model listing returned no entries — skipping the availability check.");
+      return;
+    }
+  } catch (error) {
+    log(`⚠️ Could not list available models (${error}) — skipping the check.`);
+    return;
+  }
+
+  const has = (model: string): boolean =>
+    available.some((id) => id === model || id === `models/${model}`);
+
+  if (!has(MODEL)) {
+    throw new Error(
+      `Configured MODEL "${MODEL}" is not in the ${available.length} models this API key can reach. ` +
+        `Google retires model ids on a schedule and silently reroutes some of them. ` +
+        `Pick one of: ${available.slice(0, 12).join(", ")}${
+          available.length > 12 ? ", …" : ""
+        }. Set MODEL in the workflow environment (or repo variables) to a current id.`
+    );
+  }
+  log(`✅ Model ${MODEL} is available.`);
+
+  if (!has(FALLBACK_MODEL)) {
+    log(
+      `⚠️ FALLBACK_MODEL "${FALLBACK_MODEL}" is not available — quota fallback is inert this session.`
+    );
+  }
+};
 
 let lastRequestAt = 0;
 
@@ -270,26 +374,129 @@ const withRetry = async <T>(
 // Market hours (US equities, 9:30 AM – 4:00 PM ET, weekdays)
 // ---------------------------------------------------------------------------
 
-const isMarketOpen = (): boolean => {
-  // Escape hatch so a session can be exercised outside market hours (e.g. tests).
-  if (process.env.TESTING_MODE === "true") return true;
+/**
+ * Is the market open, according to the broker?
+ *
+ * This used to be computed locally from the ET wall clock and a weekday check,
+ * which is wrong in three ways that all showed up in the order history: it
+ * knows nothing about federal holidays (three sessions ran on Labor Day 2026),
+ * nothing about half-days (1:00pm closes around Thanksgiving and Christmas),
+ * and nothing about an unscheduled halt. Alpaca publishes the authoritative
+ * answer, so ask it.
+ *
+ * Fails CLOSED. If the clock cannot be reached we do not know whether the
+ * market is open, and the safe reading of "don't know" is "don't trade" — the
+ * cost is one skipped session, versus orders fired into a closed or halted
+ * market.
+ */
+const isMarketOpen = async (): Promise<boolean> => {
+  // A dry run places no orders at all (see `placeOrder`), so it is safe to let
+  // one proceed outside market hours. This replaces the old TESTING_MODE flag,
+  // which forced this function to return `true` and thereby disabled the only
+  // gate standing between the agent and a closed market — eight orders in the
+  // history were submitted outside 09:30-16:00 ET, five of them cancelled.
+  if (DRY_RUN) {
+    log("🧪 DRY RUN: bypassing the market-hours gate (no orders can be placed).");
+    return true;
+  }
+
+  try {
+    const clock: any = await withRetry(() => alpaca.getClock(), "Alpaca getClock");
+    const isOpen = clock?.is_open === true;
+    log(
+      isOpen
+        ? `🕐 Market is OPEN (next close ${clock?.next_close}).`
+        : `🕐 Market is CLOSED (next open ${clock?.next_open}).`
+    );
+    return isOpen;
+  } catch (error) {
+    log(
+      `🛑 Could not reach Alpaca's market clock (${error}). Refusing to trade: ` +
+        `an unknown market state is treated as closed.`
+    );
+    return false;
+  }
+};
+
+/**
+ * Minutes to avoid at each end of the session before OPENING anything.
+ *
+ * Spreads are at their widest in the first minutes after the open and the
+ * closing auction distorts the last ones, and this account pays spread on
+ * every market order. Exits are unaffected — they run in the Worker every two
+ * minutes regardless of the time of day, which is the point of separating
+ * them.
+ */
+const OPEN_BUFFER_MINUTES = Number(process.env.OPEN_BUFFER_MINUTES) || 10;
+const CLOSE_BUFFER_MINUTES = Number(process.env.CLOSE_BUFFER_MINUTES) || 15;
+
+/**
+ * Is this a sensible moment to start a model session?
+ *
+ * GitHub's scheduler delivers reliably but arbitrarily late — measured on this
+ * repository, 40% of 192 scheduled runs started after the close and the worst
+ * delay was 7h25m. A late run must therefore decide for itself whether its slot
+ * is still worth using, instead of trading at whatever time it happens to wake
+ * up. The close side uses the broker's own `next_close`, so half-days are
+ * handled; the open side uses the ET clock, which is safe because the open is
+ * always 09:30 even on a half-day.
+ */
+const isGoodTimeToTrade = async (): Promise<boolean> => {
+  if (DRY_RUN) return true;
 
   const nowEt = new Date(
     new Date().toLocaleString("en-US", { timeZone: "America/New_York" })
   );
+  const minutesSinceOpen =
+    nowEt.getHours() * 60 + nowEt.getMinutes() - (9 * 60 + 30);
+  if (minutesSinceOpen < OPEN_BUFFER_MINUTES) {
+    log(
+      `⏭️  Only ${minutesSinceOpen}min since the open; waiting out the first ` +
+        `${OPEN_BUFFER_MINUTES}min when spreads are widest. Skipping this session.`
+    );
+    return false;
+  }
 
-  const day = nowEt.getDay(); // 0 = Sun, 6 = Sat
-  if (day === 0 || day === 6) return false;
+  try {
+    const clock: any = await withRetry(() => alpaca.getClock(), "Alpaca getClock");
+    const msToClose = new Date(clock.next_close).getTime() - Date.now();
+    const minutesToClose = Math.floor(msToClose / 60_000);
+    if (minutesToClose < CLOSE_BUFFER_MINUTES) {
+      log(
+        `⏭️  Only ${minutesToClose}min to the close (${clock.next_close}); too late to ` +
+          `open a position sensibly. Skipping this session — exits still run in the Worker.`
+      );
+      return false;
+    }
+    log(`🕐 ${minutesToClose}min to the close — good to trade.`);
+  } catch (error) {
+    log(`⚠️ Could not measure time to the close (${error}) — proceeding.`);
+  }
 
-  const minutes = nowEt.getHours() * 60 + nowEt.getMinutes();
-  return minutes >= 9 * 60 + 30 && minutes < 16 * 60;
+  return true;
 };
 
 // ---------------------------------------------------------------------------
 // Alpaca / market data helpers
 // ---------------------------------------------------------------------------
 
-const getStockPrice = async (ticker: string): Promise<number> => {
+interface Quote {
+  price: number;
+  /** Undefined when the source gives no two-sided quote (e.g. Yahoo fallback). */
+  bid?: number;
+  ask?: number;
+  spreadPct?: number;
+}
+
+/**
+ * Latest quote, keeping BOTH sides.
+ *
+ * The old version computed a mid from the bid and ask and returned only the
+ * mid — discarding the spread at precisely the moment it mattered, since the
+ * next thing that happens is a market order that pays it. Callers that only
+ * want a price still get one; the buy path uses the width.
+ */
+const getQuote = async (ticker: string): Promise<Quote> => {
   const symbol = ticker.toUpperCase();
 
   // Primary: Alpaca latest quote.
@@ -299,10 +506,17 @@ const getStockPrice = async (ticker: string): Promise<number> => {
       `Alpaca quote ${symbol}`
     );
     if (quote && quote.BidPrice && quote.AskPrice) {
-      const mid = (quote.BidPrice + quote.AskPrice) / 2;
+      const bid = quote.BidPrice;
+      const ask = quote.AskPrice;
+      const mid = (bid + ask) / 2;
       const price = Math.round(mid * 100) / 100;
-      log(`✅ Price for ${symbol}: $${price} (Alpaca)`);
-      return price;
+      const spreadPct = mid > 0 ? ((ask - bid) / mid) * 100 : undefined;
+      log(
+        `✅ Price for ${symbol}: $${price} (Alpaca, spread ${
+          spreadPct !== undefined ? spreadPct.toFixed(3) + "%" : "n/a"
+        })`
+      );
+      return { price, bid, ask, spreadPct };
     }
   } catch (error) {
     log(`⚠️ Alpaca quote failed for ${symbol}: ${error}`);
@@ -318,8 +532,8 @@ const getStockPrice = async (ticker: string): Promise<number> => {
       const price = data?.chart?.result?.[0]?.meta?.regularMarketPrice;
       if (typeof price === "number" && price > 0) {
         const rounded = Math.round(price * 100) / 100;
-        log(`✅ Price for ${symbol}: $${rounded} (Yahoo Finance)`);
-        return rounded;
+        log(`✅ Price for ${symbol}: $${rounded} (Yahoo Finance, no spread data)`);
+        return { price: rounded };
       }
     }
   } catch (error) {
@@ -329,26 +543,122 @@ const getStockPrice = async (ticker: string): Promise<number> => {
   throw new Error(`Could not fetch a price for ${symbol}`);
 };
 
+/** Price only, for callers that do not care about execution cost. */
+const getStockPrice = async (ticker: string): Promise<number> =>
+  (await getQuote(ticker)).price;
+
+/**
+ * Daily bars for a set of symbols, in one request.
+ *
+ * Feeds the ATR-scaled stop and the trailing stop's high-water mark. Paper
+ * accounts get the IEX feed for free; `sip` requires a market-data
+ * subscription, so IEX is the default and the failure is non-fatal — without
+ * bars the engine falls back to the flat stop, which is worse but not unsafe.
+ */
+const getDailyBars = async (
+  symbols: string[],
+  lookbackDays = 45
+): Promise<Map<string, Bar[]>> => {
+  const out = new Map<string, Bar[]>();
+  if (symbols.length === 0) return out;
+
+  const start = new Date(Date.now() - lookbackDays * 86_400_000)
+    .toISOString()
+    .slice(0, 10);
+  const feed = process.env.ALPACA_DATA_FEED || "iex";
+
+  try {
+    const url =
+      `https://data.alpaca.markets/v2/stocks/bars?symbols=${encodeURIComponent(
+        symbols.join(",")
+      )}&timeframe=1Day&start=${start}&adjustment=all&feed=${feed}&limit=10000`;
+    const res = await fetch(url, {
+      headers: {
+        "APCA-API-KEY-ID": process.env.ALPACA_API_KEY as string,
+        "APCA-API-SECRET-KEY": process.env.ALPACA_SECRET_KEY as string,
+        accept: "application/json",
+      },
+    });
+    if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+    const data: any = await res.json();
+    for (const [symbol, raw] of Object.entries<any[]>(data?.bars ?? {})) {
+      out.set(
+        symbol,
+        raw.map((bar: any) => ({
+          t: String(bar.t),
+          o: num(bar.o),
+          h: num(bar.h),
+          l: num(bar.l),
+          c: num(bar.c),
+        }))
+      );
+    }
+  } catch (error) {
+    log(
+      `⚠️ Daily bars unavailable (${error}) — volatility sizing and the trailing ` +
+        `stop fall back to the flat ${riskConfig.stopLossPct}% stop this session.`
+    );
+  }
+
+  return out;
+};
+
 const getAccount = (): Promise<any> =>
   withRetry<any>(() => alpaca.getAccount(), "Alpaca getAccount");
 
 const getPositions = (): Promise<any[]> =>
   withRetry<any[]>(() => alpaca.getPositions(), "Alpaca getPositions");
 
-const getOrderHistory = (limit = 100): Promise<any[]> =>
-  withRetry<any[]>(
-    () =>
-      alpaca.getOrders({
-        status: "all",
-        limit,
-        nested: true,
-        direction: "desc",
-        until: null,
-        after: null,
-        symbols: null,
-      } as any),
-    "Alpaca getOrders"
-  );
+/**
+ * Order history, paginated.
+ *
+ * The previous single call asked for `limit: 100` and took whatever came back.
+ * The account had 97 orders at the time of writing: at 98 the oldest fills
+ * would have started dropping off the end silently, and the two rules derived
+ * from this history — the re-buy cooldown and the holding-period check — would
+ * have begun failing OPEN on exactly the names held longest. A limit that is
+ * about to be reached is a bug with a date on it.
+ *
+ * Alpaca caps `limit` at 500 per page, so this walks backwards with `until`
+ * until a short page arrives. `maxOrders` bounds the work for the common case
+ * where only recent history matters.
+ */
+const getOrderHistory = async (maxOrders = 500): Promise<any[]> => {
+  const collected: any[] = [];
+  const seen = new Set<string>();
+  let until: string | null = null;
+
+  for (let page = 0; page < 20; page++) {
+    const pageSize = Math.min(500, Math.max(1, maxOrders - collected.length));
+    const batch: any[] = await withRetry<any[]>(
+      () =>
+        alpaca.getOrders({
+          status: "all",
+          limit: pageSize,
+          nested: true,
+          direction: "desc",
+          until,
+          after: null,
+          symbols: null,
+        } as any),
+      `Alpaca getOrders (page ${page + 1})`
+    );
+
+    if (!Array.isArray(batch) || batch.length === 0) break;
+
+    const fresh = batch.filter((order: any) => !seen.has(String(order.id)));
+    for (const order of fresh) seen.add(String(order.id));
+    collected.push(...fresh);
+
+    // A short page means the end of the history; no fresh ids means `until`
+    // stopped advancing and we would otherwise loop on the same page forever.
+    if (batch.length < pageSize || fresh.length === 0) break;
+    if (collected.length >= maxOrders) break;
+    until = String(batch[batch.length - 1].submitted_at);
+  }
+
+  return collected;
+};
 
 // Alpaca returns every numeric field as a string, and some (e.g. current_price)
 // can be missing for stale or illiquid symbols. Parse defensively so a bad
@@ -388,7 +698,7 @@ const getPortfolio = async (): Promise<Portfolio> => {
   const [account, positions, orders] = await Promise.all([
     getAccount(),
     getPositions(),
-    getOrderHistory(100),
+    getOrderHistory(300),
   ]);
 
   const openPositions: Position[] = positions
@@ -456,6 +766,9 @@ const recentSellAgeHours = async (ticker: string): Promise<number | undefined> =
         ticker: order.symbol,
         side: order.side === "buy" ? ("buy" as const) : ("sell" as const),
         date: order.filled_at,
+        // Quantity matters: without it a partial trim is indistinguishable
+        // from a full exit, which silently disables the trailing stop.
+        qty: num(order.filled_qty),
       }));
     return hoursSinceLastSell(ticker, fills);
   } catch (error) {
@@ -465,9 +778,52 @@ const recentSellAgeHours = async (ticker: string): Promise<number | undefined> =
   }
 };
 
-/** Close an entire position regardless of side or fractional quantity. */
-const closeWholePosition = (symbol: string): Promise<any> =>
-  withRetry(() => alpaca.closePosition(symbol), `Alpaca closePosition ${symbol}`);
+/**
+ * Hours since the current holding in `ticker` was opened, from broker fills.
+ *
+ * Fails open (undefined) so an unreachable history can never trap a position:
+ * if we cannot prove the holding is young, the minimum-hold rule stands down.
+ */
+const positionAgeHours = async (ticker: string): Promise<number | undefined> => {
+  try {
+    const orders = await getOrderHistory(200);
+    const fills: FillRecord[] = orders
+      .filter((order: any) => order.filled_at)
+      .map((order: any) => ({
+        ticker: order.symbol,
+        side: order.side === "buy" ? ("buy" as const) : ("sell" as const),
+        date: order.filled_at,
+        // Quantity matters: without it a partial trim is indistinguishable
+        // from a full exit, which silently disables the trailing stop.
+        qty: num(order.filled_qty),
+      }));
+    return hoursSinceEntry(ticker, fills);
+  } catch (error) {
+    log(`⚠️ Could not determine holding age for ${ticker}: ${error}`);
+    return undefined;
+  }
+};
+
+/**
+ * Close an entire position regardless of side or fractional quantity.
+ *
+ * MUST honour DRY_RUN. This function talks to Alpaca directly rather than
+ * going through `placeOrder`, because `closePosition` needs no quantity — and
+ * that shortcut meant it originally bypassed the dry-run guard entirely. A
+ * dry run then queued two real (paper) sell orders: one from the exit sweep and
+ * one from the model's `close_all`. Both paths come through here, so this is
+ * the one place the guard has to exist.
+ */
+const closeWholePosition = async (symbol: string): Promise<any> => {
+  if (DRY_RUN) {
+    log(`🧪 DRY RUN: would close the whole ${symbol} position`);
+    return { id: `dry-run-close-${symbol.toLowerCase()}`, status: "dry_run" };
+  }
+  return withRetry(
+    () => alpaca.closePosition(symbol),
+    `Alpaca closePosition ${symbol}`
+  );
+};
 
 /**
  * Peak equity from Alpaca's own equity curve. The agent keeps no state between
@@ -505,6 +861,62 @@ const getPeakEquity = async (currentEquity: number): Promise<number> => {
  * into the model's context — otherwise it would see a position silently
  * disappear and have no idea why.
  */
+/**
+ * Enrich broker positions with the volatility and high-water data the exit
+ * rules need, so the agent and the Worker judge positions identically.
+ *
+ * Both halves of the system reconstruct the trailing stop's high-water mark
+ * from bars rather than remembering it, which is what makes a trailing stop
+ * possible at all for a stateless process holding fractional shares.
+ */
+const enrichPositions = async (
+  positions: Position[],
+  fills: FillRecord[]
+): Promise<RiskPosition[]> => {
+  if (positions.length === 0) return [];
+
+  const bars = await getDailyBars(positions.map((position) => position.ticker));
+  const now = new Date();
+
+  return positions.map((position): RiskPosition => {
+    const symbolBars = bars.get(position.ticker) ?? [];
+    const heldHours = hoursSinceEntry(position.ticker, fills, now);
+    const entryTime =
+      heldHours !== undefined
+        ? new Date(now.getTime() - heldHours * 3_600_000).toISOString()
+        : undefined;
+
+    return {
+      ticker: position.ticker,
+      unrealizedPlPct: position.unrealizedPlPct,
+      currentPrice: position.currentPrice,
+      avgEntryPrice: position.avgEntryPrice,
+      atrPct: symbolBars.length > 0 ? atrPercent(symbolBars) : undefined,
+      highWaterPrice:
+        entryTime && symbolBars.length > 0
+          ? highWaterSince(symbolBars, entryTime, position.currentPrice)
+          : undefined,
+    };
+  });
+};
+
+/**
+ * Current market regime from the benchmark's own trend.
+ *
+ * Fails to NEUTRAL on any data problem rather than to risk-off: a bars outage
+ * must not silently stop the strategy, and must not silently max it out either.
+ */
+const detectCurrentRegime = async (): Promise<RegimeVerdict> => {
+  const benchmark = process.env.REGIME_BENCHMARK || "SPY";
+  // Enough calendar days to yield `regimeSlowDays` TRADING days, plus slack.
+  const lookback = Math.ceil(riskConfig.regimeSlowDays * 1.6) + 10;
+  const bars = await getDailyBars([benchmark], lookback);
+  const closes = (bars.get(benchmark) ?? []).map((bar) => bar.c);
+  const verdict = detectRegime(closes, riskConfig);
+  log(`🌐 Regime: ${verdict.reason}`);
+  return verdict;
+};
+
 const runExitSweep = async (): Promise<string> => {
   const portfolio = await getPortfolio();
   const peak = await getPeakEquity(portfolio.equity);
@@ -516,10 +928,31 @@ const runExitSweep = async (): Promise<string> => {
     )} | drawdown ${sessionDrawdownPct.toFixed(2)}%`
   );
 
-  const exits = decideExits(portfolio.positions, riskConfig);
+  const fills: FillRecord[] = portfolio.history.map((trade) => ({
+    ticker: trade.ticker,
+    side: trade.type,
+    date: trade.date,
+    qty: trade.shares,
+  }));
+
+  const enriched = await enrichPositions(portfolio.positions, fills);
+  for (const position of enriched) {
+    log(
+      `   ${position.ticker}: ${position.unrealizedPlPct.toFixed(2)}% | ` +
+        `ATR ${position.atrPct !== undefined ? position.atrPct.toFixed(2) + "%" : "n/a"} | ` +
+        `stop ${stopDistancePct(position.atrPct, riskConfig).toFixed(1)}% | ` +
+        `high-water ${
+          position.highWaterPrice !== undefined
+            ? "$" + position.highWaterPrice.toFixed(2)
+            : "n/a"
+        }`
+    );
+  }
+
+  const exits = decideExits(enriched, riskConfig);
   if (exits.length === 0) {
-    log("🛡️ Exit sweep: no positions breached stop-loss or take-profit.");
-    return "No positions breached the stop-loss or take-profit thresholds.";
+    log("🛡️ Exit sweep: no positions breached a stop, trailing stop or take-profit.");
+    return "No positions breached the stop-loss, trailing-stop or take-profit thresholds.";
   }
 
   const lines: string[] = [];
@@ -552,12 +985,67 @@ const roundTo = (value: number, decimals: number): number => {
  */
 type OrderSizing = { qty: number } | { notional: number };
 
-const placeOrder = (
+/**
+ * Deterministic client order id.
+ *
+ * Alpaca rejects a duplicate `client_order_id`, which turns the id into an
+ * idempotency key. Without one, `withRetry` is dangerous on this path: a 5xx
+ * or a socket timeout can hide a submission that actually SUCCEEDED, and the
+ * retry then opens a second position (or doubles a sale). The order history
+ * contains exactly this — two identical AMC sells four seconds apart, both
+ * filled, and five identical MSFT sells inside ten seconds.
+ *
+ * The id is derived from what the order IS — symbol, side, size, and a
+ * coarse time bucket — so a retry of the same intent collides and is refused,
+ * while a genuinely new order a few minutes later does not.
+ */
+const clientOrderId = (
+  symbol: string,
+  side: "buy" | "sell",
+  sizing: OrderSizing
+): string => {
+  const size =
+    "qty" in sizing ? `q${sizing.qty}` : `n${sizing.notional.toFixed(2)}`;
+  const bucket = Math.floor(Date.now() / (5 * 60_000));
+  return `agent-${side}-${symbol}-${size}-${bucket}`.toLowerCase().slice(0, 120);
+};
+
+const placeOrder = async (
   symbol: string,
   sizing: OrderSizing,
   side: "buy" | "sell"
-): Promise<any> =>
-  withRetry(
+): Promise<any> => {
+  const client_order_id = clientOrderId(symbol, side, sizing);
+
+  if (DRY_RUN) {
+    log(`🧪 DRY RUN: would submit ${side} ${symbol} ${JSON.stringify(sizing)}`);
+    return { id: `dry-run-${client_order_id}`, status: "dry_run" };
+  }
+
+  // Refuse to stack a second order on a symbol that already has one working.
+  // The idempotency key below catches an exact repeat; this catches the case
+  // where the model asks for a slightly different size moments later.
+  try {
+    const working: any[] = await withRetry(
+      () => alpaca.getOrders({ status: "open", limit: 50 } as any),
+      "Alpaca getOrders(open)"
+    );
+    const existing = working.find(
+      (order: any) => String(order.symbol).toUpperCase() === symbol.toUpperCase()
+    );
+    if (existing) {
+      throw new Error(
+        `An order for ${symbol} is already working (${existing.id}, ${existing.side} ` +
+          `${existing.qty ?? existing.notional}, status ${existing.status}). Not stacking another.`
+      );
+    }
+  } catch (error: any) {
+    // Only swallow the LOOKUP failing; a genuine "already working" must bubble.
+    if (/already working/.test(String(error?.message))) throw error;
+    log(`⚠️ Could not check working orders for ${symbol}: ${error}`);
+  }
+
+  return withRetry(
     () =>
       alpaca.createOrder({
         symbol,
@@ -567,10 +1055,12 @@ const placeOrder = (
         // them. Day is also the safer default for whole shares: a GTC market
         // order placed near the close can rest overnight and fill into a gap.
         time_in_force: "day",
+        client_order_id,
         ...sizing,
       } as any),
     `Alpaca ${side} ${symbol}`
   );
+};
 
 // Not every asset supports fractional trading. Cache per session — the flag is
 // effectively static and a session may size several orders in the same name.
@@ -924,6 +1414,13 @@ const executeTool = async (name: string, args: any): Promise<string> => {
           return `Specify how much ${ticker} to buy: notional (dollar amount, preferred) or shares.`;
         }
 
+        // One buy per symbol per session. Five identical MSFT sells inside ten
+        // seconds appear in the order history; the same failure on the buy
+        // side would double a position instead of flattening one.
+        if (boughtThisSession.has(ticker)) {
+          return `Already bought ${ticker} this session. One order per symbol per session — if the first fill was too small, wait for the next session rather than stacking orders.`;
+        }
+
         const [account, currentPositions] = await Promise.all([
           getAccount(),
           getPositions(),
@@ -931,11 +1428,22 @@ const executeTool = async (name: string, args: any): Promise<string> => {
         const buyingPower = num(account.buying_power);
         const held = currentPositions.find((p: any) => p.symbol === ticker);
         const existingPositionValue = held ? Math.abs(num(held.market_value)) : 0;
+        const openPositionCount = currentPositions.filter(
+          (p: any) => Math.abs(num(p.qty)) > 0
+        ).length;
 
         // Every buy is now priced, whether or not sizing needs it: the
         // penny-stock filter cannot run without a share price, and the sub-$10
         // names are exactly the ones this account must not be trading.
-        const quotedPrice = await getStockPrice(ticker);
+        const quote = await getQuote(ticker);
+        const quotedPrice = quote.price;
+
+        // Execution cost, checked before it is paid rather than discarded.
+        const spread = vetSpread(quote.bid, quote.ask, riskConfig);
+        if (!spread.acceptable) {
+          log(`🛡️ Buy blocked for ${ticker}: ${spread.reason}`);
+          return spread.reason;
+        }
 
         // Price the request in dollars so one set of risk rules covers both
         // the notional and the share-count paths.
@@ -947,16 +1455,55 @@ const executeTool = async (name: string, args: any): Promise<string> => {
           requestedNotional = Number(args.shares) * quotedPrice;
         }
 
+        // Volatility-targeted ceiling. The model proposes a dollar amount; this
+        // caps it at what the instrument's own volatility justifies, so a name
+        // that needs a wide stop cannot be held in size. This is the rule that
+        // makes a 35% adverse move in a single name survivable: the position is
+        // sized so the stop costs ~riskPerTradePct of equity, not 14% of it.
+        const equity = num(account.portfolio_value);
+        const bars = await getDailyBars([ticker]);
+        const atrPct = atrPercent(bars.get(ticker) ?? []);
+        const stopPct = stopDistancePct(atrPct, riskConfig);
+        const sized = sizePosition({
+          equity,
+          stopPct,
+          riskMultiplier: sessionRegime.riskMultiplier,
+          config: riskConfig,
+        });
+
+        // Headroom is measured against the whole position, not this order, so
+        // adding to a name already held is capped correctly.
+        const volatilityCeiling = Math.max(
+          0,
+          sized.notional - existingPositionValue
+        );
+        const volatilityLimited = requestedNotional > volatilityCeiling + 0.005;
+        const effectiveRequest = Math.min(requestedNotional, volatilityCeiling);
+
+        if (effectiveRequest < MIN_NOTIONAL) {
+          return (
+            `RISK LIMIT: volatility sizing permits a total of $${sized.notional.toFixed(
+              2
+            )} in ${ticker} (ATR ${
+              atrPct !== undefined ? atrPct.toFixed(2) + "%" : "unknown"
+            }, ${stopPct.toFixed(1)}% stop) and you already hold $${existingPositionValue.toFixed(
+              2
+            )}. ${sized.reason} No further size is available in this name.`
+          );
+        }
+
         const verdict = vetBuy({
           ticker,
-          requestedNotional,
-          equity: num(account.portfolio_value),
+          requestedNotional: effectiveRequest,
+          equity,
           cash: num(account.cash),
           existingPositionValue,
           buysThisSession,
           currentDrawdownPct: sessionDrawdownPct,
           hoursSinceLastSell: await recentSellAgeHours(ticker),
           sharePrice: quotedPrice,
+          openPositionCount,
+          maxPositionsOverride: sessionRegime.maxPositions,
           config: riskConfig,
         });
 
@@ -968,11 +1515,24 @@ const executeTool = async (name: string, args: any): Promise<string> => {
           log(`🛡️ ${verdict.reason}`);
         }
 
+        // Explain the volatility ceiling to the model whenever it bit, so the
+        // next proposal is sized correctly instead of being clamped again.
+        const volatilityNote = volatilityLimited
+          ? `\nVOLATILITY SIZING: ${ticker} has ${
+              atrPct !== undefined ? atrPct.toFixed(2) + "% daily ATR" : "no ATR estimate"
+            }, giving a ${stopPct.toFixed(1)}% stop. ${sized.reason} Your $${requestedNotional.toFixed(
+              2
+            )} request was reduced to $${effectiveRequest.toFixed(2)} before the other limits ran.`
+          : "";
+
         // Only worth an asset lookup once the trade is actually going ahead.
         const fractionable = await isFractionable(ticker);
 
         // --- Dollar-amount sizing (preferred) --------------------------------
-        if (hasNotional || verdict.clamped) {
+        // A volatility clamp also routes here: once the permitted amount is no
+        // longer the share count the model asked for, dollars are the only
+        // sizing that expresses it correctly.
+        if (hasNotional || verdict.clamped || volatilityLimited) {
           const notional = roundTo(
             Math.min(verdict.approvedNotional, buyingPower),
             2
@@ -985,11 +1545,12 @@ const executeTool = async (name: string, args: any): Promise<string> => {
 
           // Surface any risk reduction to the model so it can re-plan the rest
           // of its session around the smaller fill.
-          const note = verdict.clamped ? `\n${verdict.reason}` : "";
+          const note = (verdict.clamped ? `\n${verdict.reason}` : "") + volatilityNote;
 
           if (fractionable) {
             const order = await placeOrder(ticker, { notional }, "buy");
             buysThisSession++;
+            boughtThisSession.add(ticker);
             log(
               `💰 BUY $${notional.toFixed(2)} of ${ticker} — order ${order.id} (${order.status})`
             );
@@ -1010,6 +1571,7 @@ const executeTool = async (name: string, args: any): Promise<string> => {
           }
           const order = await placeOrder(ticker, { qty: wholeShares }, "buy");
           buysThisSession++;
+          boughtThisSession.add(ticker);
           log(`💰 BUY ${wholeShares} ${ticker} — order ${order.id} (${order.status})`);
           return `${ticker} is not fractionable, so bought whole shares: submitted BUY ${wholeShares} ${ticker} @ market (~$${(
             wholeShares * price
@@ -1036,6 +1598,7 @@ const executeTool = async (name: string, args: any): Promise<string> => {
         }
         const order = await placeOrder(ticker, { qty: shares }, "buy");
         buysThisSession++;
+        boughtThisSession.add(ticker);
         log(`💰 BUY ${shares} ${ticker} — order ${order.id} (${order.status})`);
         return `Submitted BUY ${shares} ${ticker} @ market. Order ${order.id}, status ${order.status}, est. cost $${cost.toFixed(
           2
@@ -1056,6 +1619,22 @@ const executeTool = async (name: string, args: any): Promise<string> => {
         // fractional quantity to close a position was an invitation to get the
         // magnitude wrong — and it did, repeatedly.
         if (args.close_all === true) {
+          // The minimum-hold rule applies here too. This path used to skip
+          // vetting entirely, which mattered because close_all is how the model
+          // normally exits — so the one rule aimed at same-day reversals was
+          // bypassed by the most common exit route.
+          const closeVerdict = vetSell({
+            ticker,
+            notional: positionValue,
+            positionValue,
+            hoursSinceEntry: await positionAgeHours(ticker),
+            config: riskConfig,
+          });
+          if (!closeVerdict.allowed) {
+            log(`🛡️ Close blocked for ${ticker}: ${closeVerdict.reason}`);
+            return closeVerdict.reason;
+          }
+
           const order = await closeWholePosition(ticker);
           log(`💸 CLOSE ${ticker} (${owned} shares) — order ${order?.id ?? "n/a"}`);
           return `Submitted full exit of ${ticker} (${owned} shares, ~$${positionValue.toFixed(
@@ -1092,6 +1671,7 @@ const executeTool = async (name: string, args: any): Promise<string> => {
           ticker,
           notional: shares * price,
           positionValue,
+          hoursSinceEntry: await positionAgeHours(ticker),
           config: riskConfig,
         });
         if (!sellVerdict.allowed) {
@@ -1175,21 +1755,40 @@ const logUsage = (): void => {
 const runTradingSession = async (): Promise<void> => {
   log("🚀 Starting Gemini trading session");
 
-  // Enforce exits before the model gets a turn. Stop-loss and take-profit are
-  // not suggestions it can reason its way out of.
+  // Establish the market regime BEFORE the exit sweep, so the briefing and all
+  // sizing within this session agree on one view of conditions.
+  sessionRegime = await detectCurrentRegime();
+
+  // Enforce exits before the model gets a turn. Stops are not suggestions it
+  // can reason its way out of. Note that a separate Cloudflare Worker runs this
+  // same check every two minutes — this sweep is a belt-and-braces repeat for
+  // the moment the session starts, not the primary protection it used to be.
   const exitSummary = await runExitSweep();
 
   const derisked = sessionDrawdownPct >= riskConfig.maxDrawdownPct;
   const riskBriefing =
     `RISK ENGINE REPORT (enforced automatically in code, before this session):\n` +
     `${exitSummary}\n\n` +
+    `MARKET REGIME: ${sessionRegime.reason}\n` +
+    `Effective this session: risk budget x${sessionRegime.riskMultiplier}, ` +
+    `at most ${sessionRegime.maxPositions} open position(s).\n\n` +
     `Active limits — these are enforced by code, not by you:\n` +
-    `- Positions are auto-closed at -${riskConfig.stopLossPct}% (stop-loss) or +${riskConfig.takeProfitPct}% (take-profit)\n` +
-    `- No single position may exceed ${riskConfig.maxPositionPct}% of equity; oversized buys are reduced automatically\n` +
+    `- Exits run automatically EVERY TWO MINUTES in a separate process, not just when you are awake. ` +
+    `A hard stop (${riskConfig.minStopPct}-${riskConfig.maxStopPct}%, scaled to each name's ATR), a trailing stop ` +
+    `(${riskConfig.trailAtrMultiple}x ATR below the high since entry, armed once a position is +${riskConfig.trailActivatePct}%), ` +
+    `and a +${riskConfig.takeProfitPct}% backstop. You do not need to babysit a position to protect it.\n` +
+    `- Position size is set by VOLATILITY, not by your request: each position risks ` +
+    `${riskConfig.riskPerTradePct}% of equity against its own stop, capped at ${riskConfig.maxPositionPct}% of equity. ` +
+    `A high-ATR name therefore gets a smaller position, automatically.\n` +
+    `- At most ${sessionRegime.maxPositions} open positions; a new name is refused once that is reached\n` +
+    `- A new position must be at least $${riskConfig.minPositionNotional}; smaller stakes cannot cover their own round trip\n` +
     `- A ${riskConfig.cashReservePct}% cash reserve is held back and cannot be deployed\n` +
-    `- At most ${riskConfig.maxBuysPerSession} buy orders per session\n` +
+    `- At most ${riskConfig.maxBuysPerSession} buy orders per session, one per symbol\n` +
     `- Stocks under $${riskConfig.minSharePrice}/share cannot be bought at all\n` +
+    `- Bid/ask spreads wider than ${riskConfig.maxSpreadPct}% are refused\n` +
     `- A ticker you sold cannot be re-bought for ${riskConfig.minRebuyHours}h\n` +
+    `- A position cannot be sold discretionarily for ${riskConfig.minHoldHours}h after entry. ` +
+    `Risk-engine exits ignore this, so a genuine breakdown is still handled without you.\n` +
     `- Partial sells under $${riskConfig.minSellNotional} are rejected; use close_all to exit a position\n` +
     `- Current drawdown from peak equity (${riskConfig.peakLookbackDays}-day window): ` +
     `${sessionDrawdownPct.toFixed(2)}% (position sizing halves at ${riskConfig.maxDrawdownPct}%)\n` +
@@ -1217,7 +1816,11 @@ const runTradingSession = async (): Promise<void> => {
   // daily quota runs out mid-session.
   let activeModel = MODEL;
 
-  const maxTurns = 5;
+  // The turn limit tracks the request budget so neither silently shadows the
+  // other: previously maxTurns was 5 against a budget of 5, and the budget
+  // undercounted retries, so the real stopping condition was whichever broke
+  // first — usually the quota, mid-decision.
+  const maxTurns = MAX_MODEL_REQUESTS;
   for (let turn = 1; turn <= maxTurns; turn++) {
     if (modelUsage.requests >= MAX_MODEL_REQUESTS) {
       log(
@@ -1229,6 +1832,21 @@ const runTradingSession = async (): Promise<void> => {
 
     const complete = (model: string) =>
       withRetry(async () => {
+        // Count the ATTEMPT, not the success.
+        //
+        // This increment used to sit after `withRetry` returned, so only
+        // successful calls were counted. Every 429-triggered retry was a real
+        // request charged against the real quota and invisible to the budget —
+        // which is how a session could log "3/5 requests" having actually spent
+        // seven. The budget is only a budget if it counts what the provider
+        // counts.
+        if (modelUsage.requests >= MAX_MODEL_REQUESTS) {
+          throw new Error(
+            `Model request budget exhausted (${modelUsage.requests}/${MAX_MODEL_REQUESTS}) — ` +
+              `refusing to send another request, including as a retry.`
+          );
+        }
+        modelUsage.requests++;
         await paceRequest();
         return gemini.chat.completions.create({
           model,
@@ -1252,7 +1870,9 @@ const runTradingSession = async (): Promise<void> => {
       completion = await complete(activeModel);
     }
 
-    modelUsage.requests++;
+    // `modelUsage.requests` is incremented per ATTEMPT inside `complete`, so it
+    // is deliberately not touched here. Only token accounting belongs on the
+    // success path, since a failed attempt reports no usage.
     modelUsage.promptTokens += completion.usage?.prompt_tokens ?? 0;
     modelUsage.completionTokens += completion.usage?.completion_tokens ?? 0;
 
@@ -1318,9 +1938,27 @@ const main = async (): Promise<void> => {
     process.exit(1);
   }
 
-  if (!isMarketOpen()) {
+  // Check the market BEFORE verifying the model: a closed market costs nothing
+  // to detect and saves the model-listing call entirely.
+  if (!(await isMarketOpen())) {
     log("🕐 Market is closed — exiting cleanly without trading.");
     return;
+  }
+
+  // A late-arriving run decides for itself whether its slot is still usable,
+  // before spending any Gemini quota on it.
+  if (!(await isGoodTimeToTrade())) {
+    log("👋 Done. No session run this slot.");
+    return;
+  }
+
+  // Fail loudly if the configured model has been retired or rerouted, rather
+  // than trading on whatever Google substitutes.
+  try {
+    await verifyModelAvailable();
+  } catch (error) {
+    log(`❌ ${error instanceof Error ? error.message : error}`);
+    process.exit(1);
   }
 
   await runTradingSession();

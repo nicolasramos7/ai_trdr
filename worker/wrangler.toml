@@ -1,0 +1,22 @@
+name = "trader-exit-sweep"
+main = "src/index.ts"
+compatibility_date = "2026-11-01"
+
+# Cron is UTC — Cloudflare has no timezone option, so the window is widened to
+# cover both EST and EDT and the precise open/closed decision is delegated to
+# Alpaca's own /v2/clock (which also knows about federal holidays and
+# half-days, unlike any hand-rolled weekday check).
+#
+#   EDT (Mar-Nov): 09:30-16:00 ET = 13:30-20:00 UTC
+#   EST (Nov-Mar): 09:30-16:00 ET = 14:30-21:00 UTC
+#
+# 13-21 UTC covers both. Every two minutes across 9 hours on weekdays is ~270
+# invocations a day, against a free-plan allowance of 100,000 a day.
+[triggers]
+crons = ["*/2 13-21 * * 1-5"]
+
+# Keep logs so a missed exit can actually be investigated afterwards. The
+# dashboard retains the 100 most recent cron invocations regardless; this adds
+# queryable logs on top.
+[observability]
+enabled = true
