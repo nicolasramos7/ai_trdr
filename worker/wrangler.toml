@@ -2,6 +2,17 @@ name = "trader-exit-sweep"
 main = "src/index.ts"
 compatibility_date = "2026-11-01"
 
+# No public URL. The sweep runs entirely from the cron trigger below; the
+# `fetch` handler exists only as an optional, token-gated dry-run report and
+# returns a flat 404 when SWEEP_TOKEN is unset.
+#
+# Without this line wrangler refuses to deploy a Worker that exports `fetch`
+# but has neither a route nor a workers.dev subdomain, and prompts to register
+# one. Declining the prompt then fails the deploy. Saying it here means the
+# deploy is non-interactive and the Worker has no internet-facing endpoint at
+# all, which is the right posture for something holding Alpaca credentials.
+workers_dev = false
+
 # Cron is UTC — Cloudflare has no timezone option, so the window is widened to
 # cover both EST and EDT and the precise open/closed decision is delegated to
 # Alpaca's own /v2/clock (which also knows about federal holidays and
