@@ -1,0 +1,88 @@
+name: Keepalive
+
+# This workflow exists because of a specific, measured failure.
+#
+# On 2026-10-12 the Trading agent workflow stopped running. GitHub had set it to
+# `disabled_inactivity`: on a PUBLIC repository, scheduled workflows are
+# automatically disabled after 60 days with no repository activity. The last
+# push to this repository was 2026-08-13 — exactly 60 days earlier.
+#
+# The critical detail: the agent was running four jobs a day right up to the
+# moment it was disabled. WORKFLOW RUNS DO NOT COUNT AS REPOSITORY ACTIVITY.
+# Only commits do. A keepalive that merely RUNS therefore does nothing at all;
+# it has to write.
+#
+# Cost of that outage: five weeks of no risk management, during which one
+# position drifted to -35% and the account went from +6.5% to -6.5%. It was the
+# single most expensive line in the whole review, and it was a repository
+# setting rather than a bug in the strategy.
+#
+# The notification GitHub sends before disabling goes only to whoever last
+# modified the cron syntax, which is easy to miss among CI mail.
+on:
+  schedule:
+    # Weekly, Sundays 06:00 UTC — far from the trading schedule so a delayed
+    # keepalive can never collide with a session.
+    - cron: "0 6 * * 0"
+  workflow_dispatch:
+
+# This is the one workflow that needs write access, and the only reason it does.
+permissions:
+  contents: write
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  touch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Record a heartbeat and push it
+        run: |
+          set -euo pipefail
+
+          # A plain text file, deliberately boring. The commit is the product;
+          # the file content is just somewhere for it to land.
+          mkdir -p .github
+          printf 'Last keepalive: %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" > .github/KEEPALIVE
+          printf '\nThis file exists only so that a commit lands on this repository\n' >> .github/KEEPALIVE
+          printf 'at least once a week. GitHub disables scheduled workflows on public\n' >> .github/KEEPALIVE
+          printf 'repositories after 60 days without repository activity, and workflow\n' >> .github/KEEPALIVE
+          printf 'runs do not count as activity -- only commits do. See keepalive.yml.\n' >> .github/KEEPALIVE
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Nothing to do if the content is somehow unchanged; never create an
+          # empty commit, which would not reset the timer anyway.
+          if git diff --quiet -- .github/KEEPALIVE; then
+            echo "Heartbeat unchanged — nothing to commit."
+            exit 0
+          fi
+
+          git add .github/KEEPALIVE
+          git commit -m "chore: weekly keepalive heartbeat
+
+          Keeps scheduled workflows enabled. GitHub disables cron on public
+          repositories after 60 days of no repository activity, and workflow
+          runs do not count -- only commits."
+          git push
+
+      - name: Confirm the trading schedule is still enabled
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          state=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/trading-agent.yml" \
+            --jq '.state' 2>/dev/null || echo "unknown")
+          echo "Trading agent workflow state: ${state}"
+          if [ "${state}" != "active" ]; then
+            echo "::error::The Trading agent workflow is '${state}', not 'active'. A keepalive commit cannot re-enable an already-disabled workflow — re-enable it in the Actions tab, or push a change to its cron syntax."
+            exit 1
+          fi

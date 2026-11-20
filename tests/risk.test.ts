@@ -32,6 +32,28 @@ const config: RiskConfig = {
   minSharePrice: 10,
   minSellNotional: 5,
   peakLookbackDays: 30,
+
+  riskPerTradePct: 2,
+  atrStopMultiple: 2,
+  minStopPct: 5,
+  maxStopPct: 12,
+
+  trailActivatePct: 6,
+  trailAtrMultiple: 1.5,
+  minTrailPct: 3,
+  maxTrailPct: 10,
+
+  maxPositions: 3,
+  // Deliberately inert in the shared config so the pre-existing sizing proofs
+  // below keep testing exactly the rule they were written for. The new-position
+  // floor gets its own config and its own describe block further down, rather
+  // than silently changing the expected outcome of twenty unrelated tests.
+  minPositionNotional: 0,
+  minHoldHours: 24,
+  maxSpreadPct: 0.5,
+
+  regimeFastDays: 20,
+  regimeSlowDays: 100,
 };
 
 /** A buy request that passes every rule, so each test varies one thing. */

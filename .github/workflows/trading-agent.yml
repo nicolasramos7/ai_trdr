@@ -1,42 +1,51 @@
 name: Trading agent
 
-# 4 sessions per trading day. Timezone-aware (GitHub added `timezone:` in March
-# 2026) — handles EDT/EST automatically, so no manual UTC shifting in winter.
+# THREE model sessions per trading day, down from four.
 #
-# Sizing: GitHub's scheduler is best effort. Observed delivery is ~1 run/hour
-# with the rest silently dropped, each arriving 20-40 min late. Asking for more
-# than ~1/hour buys nothing, and every extra session is another independent
-# chance for a stateless agent to churn a position — on fractional MARKET
-# orders the bid/ask spread is the dominant cost, since Alpaca charges no
-# commission. Fewer, better-placed sessions beat more of them.
+# Why fewer: exits no longer depend on this workflow at all. A Cloudflare Worker
+# (see worker/) runs the same risk engine every two minutes, so a session's only
+# job is deciding what to OWN — and for a days-to-weeks holding period that does
+# not need four looks a day. Each session is also a Gemini request budget, and
+# Google no longer publishes free-tier limits, so consumption is held to a worst
+# case of 9 requests/day (3 slots x MAX_MODEL_REQUESTS=3) which survives even the
+# most pessimistic reported quota.
 #
-# Placement: each slot is chosen so the whole delivery window [T, T+40min] is
-# tradeable, not just T.
-#   9:50  -> 9:50-10:30  overnight and pre-market news digested, opening
-#                        spreads settled; never fires before the 9:30 open.
-#   11:20 -> 11:20-12:00 late morning, still liquid.
-#   13:35 -> 13:35-14:15 afternoon, after the midday lull. The long 11:20->13:35
-#                        gap deliberately skips ~12:00-13:30, the thinnest
-#                        liquidity and widest spreads of the session.
-#   14:55 -> 14:55-15:35 last look before the ~19h overnight hole, with buffer
-#                        to stay clear of closing-auction imbalance and to
-#                        never land after the 16:00 close on a worst-case delay.
-# Slots are >=80 min apart to stay under the ~1/hour delivery throttle, and off
-# :00/:15/:30 to avoid GitHub's own cron congestion.
+# Why three rather than two: GitHub's scheduler is reliable but UNPUNCTUAL.
+# Measured across 192 scheduled runs on this repository, delivery was ~98%
+# (mean 3.92 runs/day, all four slots on 42 of 49 days) but start times sprawled
+# from 10:00 to 22:20 ET, with 40% of runs beginning after the 16:00 close and a
+# worst-case delay of 7h25m. The previous comment here claimed the opposite —
+# "~1 run/hour with the rest silently dropped" — and tuned slot PLACEMENT for a
+# drop problem that does not exist. Placement cannot fix unpunctuality; only
+# redundancy can. Three spread slots mean a badly delayed day still gets one
+# usable session.
+#
+# The agent itself decides whether a late slot is still worth using: it checks
+# Alpaca's own clock (not a local weekday guess, which ran three sessions on
+# Labor Day 2026) and skips the first 10 and last 15 minutes of the session,
+# where spreads are widest.
 on:
   schedule:
-    - cron: "50 9 * * 1-5"
+    # 10:00 ET — overnight news digested, opening spreads settled.
+    - cron: "0 10 * * 1-5"
       timezone: "America/New_York"
-    - cron: "20 11 * * 1-5"
+    # 12:30 ET — midday, with the whole afternoon still ahead if it arrives late.
+    - cron: "30 12 * * 1-5"
       timezone: "America/New_York"
-    - cron: "35 13 * * 1-5"
-      timezone: "America/New_York"
-    - cron: "55 14 * * 1-5"
+    # 14:45 ET — last look before the ~17h overnight gap. Still leaves 75min of
+    # session, so even an hour of delay lands inside the close buffer.
+    - cron: "45 14 * * 1-5"
       timezone: "America/New_York"
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run without submitting any orders"
+        type: boolean
+        default: false
 
-# Least privilege: the agent keeps no local state (portfolio lives in Alpaca and
-# each session is stateless), so the workflow never writes back to the repo.
+# Least privilege: the agent keeps no local state (the portfolio lives in Alpaca
+# and each session is stateless), so this workflow never writes to the repo. The
+# separate keepalive workflow is the only one that needs write access.
 permissions:
   contents: read
 
@@ -64,6 +73,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Verify the risk engine before trading on it
+        # The risk engine is the only thing standing between the model and the
+        # account. If its tests do not pass, do not trade: a session skipped
+        # costs nothing, a session run with a broken stop-loss cost 10% of the
+        # account last time.
+        run: npm test
+
       - name: Run trading agent (single session)
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -71,8 +87,19 @@ jobs:
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           # Optional overrides — safe to leave unset; the agent falls back to its
-          # defaults (paper endpoint, gemini-2.5-flash, profile "gemini").
+          # defaults (paper endpoint, profile "gemini").
           ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL }}
+          # Set MODEL as a repository VARIABLE (not a secret) so it can be
+          # changed without rotating anything. Google retires model ids on a
+          # schedule — gemini-2.5-flash is rerouted from 2026-12-01 — and the
+          # agent now refuses to start on a model it cannot find.
+          MODEL: ${{ vars.MODEL }}
+          FALLBACK_MODEL: ${{ vars.FALLBACK_MODEL }}
+          # Read your real figure from https://aistudio.google.com/rate-limit —
+          # Google no longer publishes free-tier limits per model. Unset
+          # defaults to 3 requests per session.
+          MAX_MODEL_REQUESTS: ${{ vars.MAX_MODEL_REQUESTS }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: npm start
 
       - name: Upload session logs
