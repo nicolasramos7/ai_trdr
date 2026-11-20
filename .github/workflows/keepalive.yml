@@ -27,8 +27,14 @@ on:
   workflow_dispatch:
 
 # This is the one workflow that needs write access, and the only reason it does.
+#
+# `actions: read` is required too, and is easy to miss: naming a `permissions`
+# block sets every scope NOT listed to `none`, so the workflow-state check in
+# the last step would get a 403 and fail the whole job on an otherwise healthy
+# keepalive.
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: keepalive
